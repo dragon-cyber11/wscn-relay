@@ -1,0 +1,95 @@
+name: probe
+
+on:
+  workflow_dispatch:
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Probe wallstreetcn access paths
+        run: |
+          cat > probe.py <<'PYEOF'
+          import json, urllib.parse, urllib.request, urllib.error
+
+          UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36")
+          API = ("https://api-one.wallstcn.com/apiv1/content/lives"
+                 "?channel=global&accept=live&limit=3")
+
+          def get(name, url, headers=None, timeout=20):
+              h = {"User-Agent": UA}
+              h.update(headers or {})
+              try:
+                  req = urllib.request.Request(url, headers=h)
+                  with urllib.request.urlopen(req, timeout=timeout) as r:
+                      raw = r.read()
+                  txt = raw[:300].decode("utf-8", "replace").replace("\n", " ")
+                  hit = "快讯" in raw.decode("utf-8", "replace") or '"code":20000' in txt
+                  print("  OK   %-22s len=%-7d %s | %s"
+                        % (name, len(raw), "DATA-OK" if hit else "no-data", txt[:150]))
+                  return raw if hit else None
+              except urllib.error.HTTPError as e:
+                  b = e.read()[:150].decode("utf-8", "replace").replace("\n", " ")
+                  print("  FAIL %-22s HTTP %s  %s" % (name, e.code, b))
+              except Exception as e:
+                  print("  FAIL %-22s %s: %s" % (name, type(e).__name__, e))
+              return None
+
+          print("=== 0. runner identity ===")
+          get("ipify", "https://api.ipify.org?format=json")
+          get("ipinfo", "https://ipinfo.io/json")
+
+          print("\n=== 1. direct API, header variants ===")
+          get("minimal", API)
+          get("no-origin", API, {
+              "Accept": "application/json, text/plain, */*",
+              "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+              "Referer": "https://wallstreetcn.com/"})
+          get("with-origin", API, {
+              "Accept": "application/json, text/plain, */*",
+              "Referer": "https://wallstreetcn.com/live/global",
+              "Origin": "https://wallstreetcn.com"})
+          get("sec-fetch", API, {
+              "Accept": "application/json, text/plain, */*",
+              "Accept-Language": "zh-CN,zh;q=0.9",
+              "Referer": "https://wallstreetcn.com/",
+              "Sec-Fetch-Dest": "empty",
+              "Sec-Fetch-Mode": "cors",
+              "Sec-Fetch-Site": "same-site",
+              "sec-ch-ua": '"Chromium";v="126", "Not)A;Brand";v="24"',
+              "sec-ch-ua-mobile": "?0",
+              "sec-ch-ua-platform": '"Windows"'})
+
+          print("\n=== 2. alternate hosts / endpoints ===")
+          get("api.wallstcn", API.replace("api-one.", "api."))
+          get("html-live", "https://wallstreetcn.com/live/global",
+              {"Accept": "text/html,application/xhtml+xml"})
+          get("news-flow",
+              "https://api-one.wallstcn.com/apiv1/content/information-flow"
+              "?channel=global-channel&accept=article&limit=3")
+
+          print("\n=== 3. public relays (러너 IP 우회) ===")
+          enc = urllib.parse.quote(API, safe="")
+          get("allorigins", "https://api.allorigins.win/raw?url=" + enc)
+          get("corsproxy", "https://corsproxy.io/?url=" + enc)
+          get("codetabs",
+              "https://api.codetabs.com/v1/proxy/?quest=" + enc)
+          get("jina", "https://r.jina.ai/" + API)
+          get("thingproxy",
+              "https://thingproxy.freeboard.io/fetch/" + API)
+
+          print("\n=== 4. RSSHub public instances (fallback) ===")
+          for h in ["https://rsshub.app", "https://rsshub.rssforever.com",
+                    "https://hub.slarker.me"]:
+              get(h.split("//")[1], h + "/wallstreetcn/news/global",
+                  {"Accept": "application/rss+xml, application/xml, text/xml"})
+
+          print("\n=== done ===")
+          PYEOF
+          python3 probe.py
