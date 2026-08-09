@@ -1,0 +1,487 @@
+name: wscn
+
+on:
+  workflow_dispatch:
+    inputs:
+      init_only:
+        description: "1이면 초기화만 하고 전송 안 함"
+        required: false
+        default: "0"
+  schedule:
+    - cron: "*/20 * * * *"
+
+permissions:
+  contents: write
+  actions: write
+
+concurrency:
+  group: wscn
+  cancel-in-progress: false
+
+jobs:
+  # ── 감시견: 20분마다 하트비트 확인, 30분 무응답이면 릴레이 재시작 ──
+  watchdog:
+    if: github.event_name == 'schedule'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Check heartbeat & restart if stale
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          HB=.state/wscn_heartbeat.txt
+          STALE=1
+          if [ -f "$HB" ]; then
+            cat "$HB"
+            LAST=$(git log -1 --format=%ct -- "$HB")
+            AGE=$(( $(date +%s) - ${LAST:-0} ))
+            echo "heartbeat age = ${AGE}s"
+            [ "$AGE" -le 1800 ] && STALE=0
+          else
+            echo "no heartbeat file"
+          fi
+          if [ "$STALE" = "1" ]; then
+            curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+              -d chat_id="${TELEGRAM_CHAT_ID}" \
+              -d text="🐕 wscn 릴레이 무응답 — 감시견이 재시작합니다" >/dev/null || true
+            gh workflow run wscn.yml --ref main -f init_only=0
+          else
+            echo "alive, nothing to do"
+          fi
+
+  # ── 릴레이 본체: 5시간 50분 돌고 스스로 다음 잡 호출 ──
+  relay:
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 355
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      # 대기열에 오래 있던 잡이 옛날 상태로 시작하는 것 방지
+      - name: Force sync to origin/main
+        run: |
+          git fetch origin main
+          git reset --hard origin/main
+          git log -1 --oneline
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Write relay script
+        run: |
+          mkdir -p scripts .state
+          cat > scripts/wscn_relay.py <<'PYEOF'
+          #!/usr/bin/env python3
+          # -*- coding: utf-8 -*-
+          """华尔街见闻 7x24 快讯 -> 텔레그램. 속보(lives)만 중계."""
+
+          import json, os, re, subprocess, sys, time
+          import urllib.parse, urllib.request
+          from datetime import datetime, timedelta, timezone
+
+          LIVES_URL = "https://api-one.wallstcn.com/apiv1/content/lives"
+          CHANNEL = os.environ.get("WSCN_CHANNEL", "global")
+          BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
+          CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
+
+          RUN_SECONDS = int(os.environ.get("RUN_SECONDS", "600"))
+          POLL_INTERVAL = float(os.environ.get("POLL_INTERVAL", "1.0"))
+          COMMIT_EVERY = int(os.environ.get("COMMIT_EVERY", "600"))
+          INIT_ONLY = os.environ.get("INIT_ONLY", "0") == "1"
+
+          STATE_DIR = ".state"
+          F_LAST_ID = STATE_DIR + "/wscn_last_id.txt"
+          F_HEARTBEAT = STATE_DIR + "/wscn_heartbeat.txt"
+          F_SENT = STATE_DIR + "/wscn_sent_titles.json"
+
+          KST = timezone(timedelta(hours=9))
+          SEND_GAP = 3.5
+          MAX_PER_CYCLE = 18
+          TITLE_MAX = 1200
+          BACKFILL_MAX = 200
+          STALL_ALERT_SEC = 300
+          UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36")
+
+          # 🚨 판정: 제목 맨 앞의 【라벨】 이 속보성이면 사이렌
+          BREAKING_LABELS = ["突发", "快讯", "重磅", "独家", "紧急", "刚刚", "爆"]
+          LABEL_RE = re.compile(r"^\s*[【\[]\s*([^】\]]{1,12})\s*[】\]]")
+
+          def log(m):
+              print("[%s] %s" % (datetime.now(KST).strftime("%H:%M:%S"), m), flush=True)
+
+          def http_json(url, timeout=10):
+              req = urllib.request.Request(url, headers={
+                  "User-Agent": UA, "Accept": "application/json, text/plain, */*",
+                  "Referer": "https://wallstreetcn.com/live/global",
+                  "Origin": "https://wallstreetcn.com"})
+              with urllib.request.urlopen(req, timeout=timeout) as r:
+                  return json.loads(r.read().decode("utf-8", "replace"))
+
+          def read_text(p, d=""):
+              try:
+                  return open(p, encoding="utf-8").read().strip()
+              except Exception:
+                  return d
+
+          def write_text(p, s):
+              os.makedirs(os.path.dirname(p), exist_ok=True)
+              with open(p, "w", encoding="utf-8") as f:
+                  f.write(s)
+
+          def load_sent():
+              try:
+                  d = json.load(open(F_SENT, encoding="utf-8"))
+                  c = time.time() - 86400
+                  return {k: v for k, v in d.items() if v > c}
+              except Exception:
+                  return {}
+
+          def save_sent(d):
+              c = time.time() - 86400
+              write_text(F_SENT, json.dumps(
+                  {k: v for k, v in d.items() if v > c}, ensure_ascii=False))
+
+          _tr = {}
+          def translate(t):
+              """비공식 구글 번역. 실패하면 원문 반환(봇은 안 멈춤)."""
+              if not t:
+                  return ""
+              k = t[:500]
+              if k in _tr:
+                  return _tr[k]
+              try:
+                  url = ("https://translate.googleapis.com/translate_a/single"
+                         "?client=gtx&sl=zh-CN&tl=ko&dt=t&q="
+                         + urllib.parse.quote(t[:4500]))
+                  req = urllib.request.Request(url, headers={"User-Agent": UA})
+                  with urllib.request.urlopen(req, timeout=8) as r:
+                      d = json.loads(r.read().decode("utf-8", "replace"))
+                  out = "".join(s[0] for s in d[0] if s and s[0]).strip()
+                  if out:
+                      _tr[k] = out
+                      return out
+              except Exception as e:
+                  log("translate fail: %s" % e)
+              return t
+
+          def tg_send(text):
+              """응답을 받았을 때만 전송 여부를 판단. 타임아웃은 보낸 것으로 간주(재시도 금지)."""
+              if not BOT_TOKEN or not CHAT_ID:
+                  return False, "no_credentials"
+              url = "https://api.telegram.org/bot%s/sendMessage" % BOT_TOKEN
+              body = urllib.parse.urlencode({
+                  "chat_id": CHAT_ID, "text": text,
+                  "disable_web_page_preview": "true"}).encode()
+              for _ in range(3):
+                  try:
+                      req = urllib.request.Request(url, data=body, headers={
+                          "Content-Type": "application/x-www-form-urlencoded"})
+                      with urllib.request.urlopen(req, timeout=15) as r:
+                          r.read()
+                          return True, "ok"
+                  except urllib.error.HTTPError as e:
+                      code = e.code
+                      try:
+                          j = json.loads(e.read().decode("utf-8", "replace"))
+                      except Exception:
+                          j = {}
+                      if code == 429:
+                          w = int(j.get("parameters", {}).get("retry_after", 5))
+                          log("429 -> sleep %ds" % w)
+                          time.sleep(min(w + 1, 60))
+                          continue
+                      if code == 401:
+                          return False, "auth_error_401"
+                      if code == 400:
+                          return False, "bad_request_400"
+                      return False, "http_%d" % code
+                  except Exception as e:
+                      log("unknown-state (%s) -> treat as sent" % type(e).__name__)
+                      return True, "unknown_treated_sent"
+              return False, "retry_exhausted"
+
+          def to_kst(dt_val):
+              """실패하면 None. '봇 시각'으로 조용히 대체되지 않게 함."""
+              try:
+                  if isinstance(dt_val, (int, float)):
+                      ts = float(dt_val)
+                  else:
+                      s = str(dt_val).strip()
+                      if re.fullmatch(r"\d+(\.\d+)?", s):
+                          ts = float(s)
+                      else:
+                          m = re.match(
+                              r"(\d{4})-(\d{2})-(\d{2})[T ](\d{2}):(\d{2}):(\d{2})", s)
+                          if not m:
+                              return None
+                          d = datetime(*[int(x) for x in m.groups()], tzinfo=timezone.utc)
+                          return d.astimezone(KST).strftime("%H:%M")
+                  if ts > 1e11:
+                      ts /= 1000.0
+                  return datetime.fromtimestamp(ts, tz=timezone.utc).astimezone(
+                      KST).strftime("%H:%M")
+              except Exception:
+                  return None
+
+          def clean(s):
+              if not s:
+                  return ""
+              s = re.sub(r"<br\s*/?>", "\n", s)
+              s = re.sub(r"</p>", "\n", s)
+              s = re.sub(r"<[^>]+>", "", s)
+              for a, b in [("&nbsp;", " "), ("&amp;", "&"), ("&quot;", '"'),
+                           ("&#34;", '"'), ("&lt;", "<"), ("&gt;", ">")]:
+                  s = s.replace(a, b)
+              return re.sub(r"\n{3,}", "\n\n", s).strip()
+
+          def headline(it):
+              """快讯은 title이 비어있는 경우가 많음 -> content_text 첫 줄로 대체"""
+              t = clean(it.get("title") or "")
+              if not t:
+                  t = clean(it.get("highlight_title") or "")
+              if not t:
+                  t = clean(it.get("content_text") or it.get("content") or "")
+                  t = t.split("\n")[0].strip()
+              return t[:TITLE_MAX]
+
+          def label_of(head):
+              m = LABEL_RE.match(head or "")
+              return m.group(1) if m else None
+
+          def is_breaking(head, it):
+              lab = label_of(head)
+              if lab and any(k in lab for k in BREAKING_LABELS):
+                  return True
+              if (it.get("highlight_title") or "").strip():
+                  return True
+              return False
+
+          def fetch(limit=20, cursor=None):
+              url = "%s?channel=%s&accept=live&limit=%d" % (LIVES_URL, CHANNEL, limit)
+              if cursor:
+                  url += "&cursor=%s" % cursor
+              d = http_json(url)
+              if d.get("code") != 20000:
+                  raise RuntimeError("api code=%s" % d.get("code"))
+              dd = d.get("data") or {}
+              items = [x for x in (dd.get("items") or []) if x.get("type") == "live"]
+              return items, dd.get("next_cursor")
+
+          def fetch_since(last_id):
+              """API가 한 번에 20건만 줌 -> 마지막 id 만날 때까지 되짚기(최대 200건)"""
+              out, cursor, seen = [], None, set()
+              while len(out) < BACKFILL_MAX:
+                  items, nxt = fetch(20, cursor)
+                  if not items:
+                      break
+                  hit = False
+                  for it in items:
+                      i = int(it.get("id") or 0)
+                      if i in seen:
+                          continue
+                      seen.add(i)
+                      if last_id and i <= last_id:
+                          hit = True
+                          break
+                      out.append(it)
+                  if hit or not nxt or not last_id:
+                      break
+                  cursor = nxt
+              out.sort(key=lambda x: int(x.get("id") or 0))
+              return out
+
+          def git(*a):
+              try:
+                  return subprocess.run(["git"] + list(a), capture_output=True,
+                                        text=True, timeout=60)
+              except Exception as e:
+                  log("git error: %s" % e)
+                  return None
+
+          def commit_state():
+              """rebase 쓰면 충돌로 커밋이 영원히 안 올라감 -> reset --mixed 방식"""
+              git("add", "-A", STATE_DIR)
+              r = git("diff", "--cached", "--quiet")
+              if r is not None and r.returncode == 0:
+                  return
+              stamp = datetime.now(KST).strftime("%m-%d %H:%M")
+              cid = ["-c", "user.name=wscn-relay", "-c", "user.email=relay@local"]
+              git(*(cid + ["commit", "-m", "state: wscn %s" % stamp]))
+              p = git("push", "origin", "HEAD:main")
+              if p is not None and p.returncode != 0:
+                  log("push conflict -> fetch + reset --mixed")
+                  git("fetch", "origin", "main")
+                  git("reset", "--mixed", "origin/main")
+                  git("add", "-A", STATE_DIR)
+                  git(*(cid + ["commit", "-m", "state: wscn resync %s" % stamp]))
+                  git("push", "origin", "HEAD:main")
+
+          def heartbeat(**kw):
+              p = ["at=%s" % datetime.now(KST).strftime("%Y-%m-%d %H:%M:%S KST")]
+              p += ["%s=%s" % (k, v) for k, v in kw.items()]
+              write_text(F_HEARTBEAT, " ".join(p) + "\n")
+
+          def main():
+              if not BOT_TOKEN or not CHAT_ID:
+                  log("FATAL: TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID 미설정")
+                  return 1
+              os.makedirs(STATE_DIR, exist_ok=True)
+              last_id = int(read_text(F_LAST_ID, "0") or "0")
+              sent = load_sent()
+              log("start ch=%s last_id=%s run=%ds init=%s"
+                  % (CHANNEL, last_id, RUN_SECONDS, INIT_ONLY))
+
+              if last_id == 0 or INIT_ONLY:
+                  try:
+                      items, _ = fetch(20)
+                      if items:
+                          newest = max(int(x.get("id") or 0) for x in items)
+                          write_text(F_LAST_ID, str(newest))
+                          heartbeat(mode="init", last_id=newest, send="0(init)")
+                          commit_state()
+                          log("INIT done last_id=%d (전송 안 함)" % newest)
+                          return 0
+                  except Exception as e:
+                      log("INIT failed: %s" % e)
+                      return 1
+
+              t0 = tc = tn = time.time()
+              alerted = False
+              total = 0
+              reason = "ok"
+              lag = -1
+              labels = {}
+
+              while time.time() - t0 < RUN_SECONDS:
+                  cyc = time.time()
+                  try:
+                      fresh = fetch_since(last_id)
+                  except Exception as e:
+                      reason = "fetch_error:%s" % type(e).__name__
+                      log("fetch error: %s" % e)
+                      time.sleep(min(POLL_INTERVAL * 5, 10))
+                      continue
+
+                  if fresh:
+                      tn = time.time()
+                      if alerted:
+                          tg_send("✅ 华尔街见闻 속보 피드 복구됨")
+                          alerted = False
+                      n = 0
+                      for it in fresh:
+                          if n >= MAX_PER_CYCLE:
+                              break
+                          iid = int(it.get("id") or 0)
+                          head = headline(it)
+                          if not head:
+                              last_id = max(last_id, iid)
+                              continue
+                          key = head[:120]
+                          if key in sent:
+                              last_id = max(last_id, iid)
+                              continue
+
+                          lab = label_of(head)
+                          if lab:
+                              labels[lab] = labels.get(lab, 0) + 1
+
+                          ko = translate(head)
+                          hhmm = to_kst(it.get("display_time"))
+                          mark = "🚨 " if is_breaking(head, it) else ""
+
+                          lines = ["%s%s" % (mark, ko)]
+                          if ko.strip() != head.strip():
+                              lines.append("(원문: %s)" % head)
+                          if hhmm:
+                              lines.append("(%s)" % hhmm)
+                          msg = "\n".join(lines)
+                          if len(msg) > 4000:
+                              msg = msg[:3990] + "…"
+
+                          ok, reason = tg_send(msg)
+                          if ok:
+                              sent[key] = time.time()
+                              total += 1
+                              n += 1
+                              last_id = max(last_id, iid)
+                              write_text(F_LAST_ID, str(last_id))
+                          else:
+                              log("send failed (%s) -> 다음 주기 재시도" % reason)
+                              break
+                          try:
+                              lag = int(time.time() - float(it.get("display_time") or 0))
+                          except Exception:
+                              lag = -1
+                          time.sleep(SEND_GAP)
+
+                  if (not alerted) and (time.time() - tn > STALL_ALERT_SEC) and (
+                          reason.startswith("fetch_error") or reason.startswith("http_")):
+                      tg_send("⚠️ 华尔街见闻 속보 피드 이상 (%s) — %d분째 신규 없음"
+                              % (reason, int((time.time() - tn) / 60)))
+                      alerted = True
+
+                  if time.time() - tc > COMMIT_EVERY:
+                      save_sent(sent)
+                      heartbeat(last_id=last_id, send="%d건" % total, reason=reason,
+                                lag=lag,
+                                labels=",".join("%s:%s" % kv
+                                                for kv in sorted(labels.items())) or "-")
+                      commit_state()
+                      tc = time.time()
+
+                  el = time.time() - cyc
+                  if el < POLL_INTERVAL:
+                      time.sleep(POLL_INTERVAL - el)
+
+              save_sent(sent)
+              heartbeat(last_id=last_id, send="%d건" % total, reason=reason, lag=lag,
+                        labels=",".join("%s:%s" % kv
+                                        for kv in sorted(labels.items())) or "-",
+                        exit="normal")
+              commit_state()
+              log("done sent=%d last_id=%d" % (total, last_id))
+              return 0
+
+          if __name__ == "__main__":
+              sys.exit(main())
+          PYEOF
+          python3 -m py_compile scripts/wscn_relay.py && echo "script OK"
+
+      - name: Run relay
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          WSCN_CHANNEL: global
+          INIT_ONLY: ${{ github.event.inputs.init_only }}
+        run: |
+          set +e
+          if [ "$INIT_ONLY" = "1" ]; then
+            RUN_SECONDS=60 python3 scripts/wscn_relay.py
+            exit 0
+          fi
+          END=$(( $(date +%s) + 21000 ))
+          while [ $(date +%s) -lt $END ]; do
+            RUN_SECONDS=600 python3 scripts/wscn_relay.py
+            echo "--- cycle ended, restarting ---"
+            sleep 2
+          done
+
+      # 주 방식: 끝나기 직전 스스로 다음 잡 호출 (cron을 믿지 않음)
+      - name: Chain next run
+        if: always() && github.event.inputs.init_only != '1'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh workflow run wscn.yml --ref main -f init_only=0 || echo "chain failed"
