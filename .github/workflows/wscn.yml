@@ -91,7 +91,7 @@ jobs:
           import urllib.parse, urllib.request
           from datetime import datetime, timedelta, timezone
 
-          LIVES_URL = "https://api-one.wallstcn.com/apiv1/content/lives"
+          HOSTS = ["https://api-one.wallstcn.com", "https://api.wallstcn.com"]
           CHANNEL = os.environ.get("WSCN_CHANNEL", "global")
           BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
           CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
@@ -115,6 +115,23 @@ jobs:
           UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
                 "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36")
 
+          class Blocked(Exception):
+              """모든 경로가 403 — 러너 IP가 차단됨. 잡을 끝내고 새 러너를 받아야 함."""
+
+          HDRS = [
+              {"Accept": "application/json, text/plain, */*",
+               "Referer": "https://wallstreetcn.com/live/global",
+               "Origin": "https://wallstreetcn.com"},
+              {"Accept": "application/json, text/plain, */*",
+               "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+               "Referer": "https://wallstreetcn.com/"},
+              {"Accept": "application/json, text/plain, */*",
+               "Accept-Language": "zh-CN,zh;q=0.9",
+               "Referer": "https://wallstreetcn.com/",
+               "Sec-Fetch-Dest": "empty", "Sec-Fetch-Mode": "cors",
+               "Sec-Fetch-Site": "same-site"},
+          ]
+
           # 🚨 판정: 제목 맨 앞의 【라벨】 이 속보성이면 사이렌
           BREAKING_LABELS = ["突发", "快讯", "重磅", "独家", "紧急", "刚刚", "爆"]
           LABEL_RE = re.compile(r"^\s*[【\[]\s*([^】\]]{1,12})\s*[】\]]")
@@ -122,13 +139,27 @@ jobs:
           def log(m):
               print("[%s] %s" % (datetime.now(KST).strftime("%H:%M:%S"), m), flush=True)
 
-          def http_json(url, timeout=10):
-              req = urllib.request.Request(url, headers={
-                  "User-Agent": UA, "Accept": "application/json, text/plain, */*",
-                  "Referer": "https://wallstreetcn.com/live/global",
-                  "Origin": "https://wallstreetcn.com"})
-              with urllib.request.urlopen(req, timeout=timeout) as r:
-                  return json.loads(r.read().decode("utf-8", "replace"))
+          def http_json(path, timeout=10):
+              """호스트 2개 x 헤더 3종을 번갈아 시도. 전부 403이면 Blocked."""
+              saw_403 = False
+              for host in HOSTS:
+                  for h in HDRS:
+                      hh = {"User-Agent": UA}
+                      hh.update(h)
+                      try:
+                          req = urllib.request.Request(host + path, headers=hh)
+                          with urllib.request.urlopen(req, timeout=timeout) as r:
+                              return json.loads(r.read().decode("utf-8", "replace"))
+                      except urllib.error.HTTPError as e:
+                          if e.code in (403, 429):
+                              saw_403 = True
+                              continue
+                          raise
+                      except Exception:
+                          continue
+              if saw_403:
+                  raise Blocked("all routes 403 (runner IP blocked)")
+              raise RuntimeError("all routes failed")
 
           def read_text(p, d=""):
               try:
@@ -270,10 +301,11 @@ jobs:
               return False
 
           def fetch(limit=20, cursor=None):
-              url = "%s?channel=%s&accept=live&limit=%d" % (LIVES_URL, CHANNEL, limit)
+              p = ("/apiv1/content/lives?channel=%s&accept=live&limit=%d"
+                   % (CHANNEL, limit))
               if cursor:
-                  url += "&cursor=%s" % cursor
-              d = http_json(url)
+                  p += "&cursor=%s" % cursor
+              d = http_json(p)
               if d.get("code") != 20000:
                   raise RuntimeError("api code=%s" % d.get("code"))
               dd = d.get("data") or {}
@@ -345,18 +377,24 @@ jobs:
                   % (CHANNEL, last_id, RUN_SECONDS, INIT_ONLY))
 
               if last_id == 0 or INIT_ONLY:
-                  try:
-                      items, _ = fetch(20)
-                      if items:
-                          newest = max(int(x.get("id") or 0) for x in items)
-                          write_text(F_LAST_ID, str(newest))
-                          heartbeat(mode="init", last_id=newest, send="0(init)")
-                          commit_state()
-                          log("INIT done last_id=%d (전송 안 함)" % newest)
-                          return 0
-                  except Exception as e:
-                      log("INIT failed: %s" % e)
-                      return 1
+                  for att in range(1, 6):
+                      try:
+                          items, _ = fetch(20)
+                          if items:
+                              newest = max(int(x.get("id") or 0) for x in items)
+                              write_text(F_LAST_ID, str(newest))
+                              heartbeat(mode="init", last_id=newest, send="0(init)")
+                              commit_state()
+                              log("INIT done last_id=%d (전송 안 함)" % newest)
+                              return 0
+                          log("INIT empty items (%d/5)" % att)
+                      except Blocked as e:
+                          log("INIT blocked: %s -> 러너 교체 필요" % e)
+                          return 2
+                      except Exception as e:
+                          log("INIT failed (%d/5): %s" % (att, e))
+                      time.sleep(3)
+                  return 1
 
               t0 = tc = tn = time.time()
               alerted = False
@@ -364,11 +402,25 @@ jobs:
               reason = "ok"
               lag = -1
               labels = {}
+              blocked = 0
 
               while time.time() - t0 < RUN_SECONDS:
                   cyc = time.time()
                   try:
                       fresh = fetch_since(last_id)
+                      blocked = 0
+                  except Blocked as e:
+                      blocked += 1
+                      reason = "blocked_403"
+                      log("blocked %d/10: %s" % (blocked, e))
+                      if blocked >= 10:
+                          heartbeat(last_id=last_id, send="%d건" % total,
+                                    reason="blocked_403", exit="reroll_runner")
+                          commit_state()
+                          tg_send("⚠️ 华尔街见闻 API 403 차단 — 러너를 교체합니다")
+                          return 2
+                      time.sleep(10)
+                      continue
                   except Exception as e:
                       reason = "fetch_error:%s" % type(e).__name__
                       log("fetch error: %s" % e)
@@ -470,11 +522,17 @@ jobs:
           set +e
           if [ "$INIT_ONLY" = "1" ]; then
             RUN_SECONDS=60 python3 scripts/wscn_relay.py
+            echo "init exit=$?"
             exit 0
           fi
           END=$(( $(date +%s) + 21000 ))
           while [ $(date +%s) -lt $END ]; do
             RUN_SECONDS=600 python3 scripts/wscn_relay.py
+            RC=$?
+            if [ "$RC" = "2" ]; then
+              echo "=== runner IP blocked (403) -> 잡을 끝내고 새 러너를 받는다 ==="
+              break
+            fi
             echo "--- cycle ended, restarting ---"
             sleep 2
           done
