@@ -1,1 +1,1 @@
-at=2026-08-10 07:21:45 KST last_id=3147119 send=0건 reason=bad_request_400 lag=-1 labels=-
+at=2026-08-10 07:21:46 KST last_id=3147119 send=0건 reason=bad_request_400 lag=-1 labels=- exit=normal
