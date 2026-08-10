@@ -1,1 +1,1 @@
-at=2026-08-10 18:44:21 KST last_id=3147396 send=7건 reason=ok lag=2440 labels=- exit=normal
+at=2026-08-10 18:54:24 KST last_id=3147396 send=0건 reason=ok lag=-1 labels=-
