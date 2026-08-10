@@ -14,16 +14,16 @@ permissions:
   contents: write
   actions: write
 
-concurrency:
-  group: wscn
-  cancel-in-progress: false
-
 jobs:
   # ── 감시견: 20분마다 하트비트 확인, 30분 무응답이면 릴레이 재시작 ──
   watchdog:
     if: github.event_name == 'schedule'
     runs-on: ubuntu-latest
     timeout-minutes: 5
+    # 릴레이와 다른 그룹이어야 릴레이가 도는 동안에도 감시견이 실행됨
+    concurrency:
+      group: wscn-watchdog
+      cancel-in-progress: true
     steps:
       - uses: actions/checkout@v4
         with:
@@ -61,6 +61,10 @@ jobs:
     if: github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     timeout-minutes: 355
+    # 릴레이는 절대 두 개가 동시에 돌면 안 됨 (중복 발송)
+    concurrency:
+      group: wscn-relay
+      cancel-in-progress: false
     steps:
       - uses: actions/checkout@v4
         with:
@@ -112,8 +116,16 @@ jobs:
           TITLE_MAX = 1200
           BACKFILL_MAX = 200
           STALL_ALERT_SEC = 300
+          SEND_BACKOFF = 30       # 전송 실패 후 다음 시도까지 (핫루프 방지)
+          MAX_TIMEOUT_RETRY = 3   # 거절 직후 타임아웃 재시도 상한 (중복 폭탄 방지)
           UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
                 "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36")
+
+          # 400 중 "설정이 틀렸다"는 것들 — 절대 뉴스를 버리면 안 되고 무한 재시도
+          CONFIG_400 = ("chat not found", "not a member", "not enough rights",
+                        "chat_id is empty", "bot was blocked", "bot was kicked",
+                        "chat is deactivated", "have no rights", "user is deactivated")
+          _reject_streak = 0   # 연속으로 명시적 거절을 받은 횟수
 
           class Blocked(Exception):
               """모든 경로가 403 — 러너 IP가 차단됨. 잡을 끝내고 새 러너를 받아야 함."""
@@ -209,7 +221,16 @@ jobs:
               return t
 
           def tg_send(text):
-              """응답을 받았을 때만 전송 여부를 판단. 타임아웃은 보낸 것으로 간주(재시도 금지)."""
+              """
+              전송 판정 규칙
+                200            -> 성공
+                429            -> 서버가 명시적 거절, 대기 후 재시도
+                400/401        -> 명시적 거절 = 확실히 미전송. 원인을 분류해서 반환
+                응답 없음(타임아웃) -> 전달 여부 불명
+                   - 직전까지 정상이었다면: 중복 폭탄을 피하려고 '보낸 것'으로 간주
+                   - 직전에 명시적 거절이 있었다면: 실패로 간주 (뉴스 유실 방지)
+              """
+              global _reject_streak
               if not BOT_TOKEN or not CHAT_ID:
                   return False, "no_credentials"
               url = "https://api.telegram.org/bot%s/sendMessage" % BOT_TOKEN
@@ -222,6 +243,7 @@ jobs:
                           "Content-Type": "application/x-www-form-urlencoded"})
                       with urllib.request.urlopen(req, timeout=15) as r:
                           r.read()
+                          _reject_streak = 0
                           return True, "ok"
                   except urllib.error.HTTPError as e:
                       code = e.code
@@ -229,17 +251,26 @@ jobs:
                           j = json.loads(e.read().decode("utf-8", "replace"))
                       except Exception:
                           j = {}
+                      desc = (j.get("description") or "").lower()
                       if code == 429:
                           w = int(j.get("parameters", {}).get("retry_after", 5))
                           log("429 -> sleep %ds" % w)
                           time.sleep(min(w + 1, 60))
                           continue
+                      _reject_streak += 1
                       if code == 401:
-                          return False, "auth_error_401"
+                          return False, "auth_401"
                       if code == 400:
-                          return False, "bad_request_400"
+                          kind = "cfg" if any(x in desc for x in CONFIG_400) else "msg"
+                          log("400/%s: %s" % (kind, desc[:80]))
+                          return False, "bad400_%s" % kind
                       return False, "http_%d" % code
                   except Exception as e:
+                      if _reject_streak > 0:
+                          # 방금까지 거절당하던 중의 타임아웃 -> 갔을 리 없다
+                          log("timeout (거절 %d회 직후) -> 실패로 처리, 뉴스 보존"
+                              % _reject_streak)
+                          return False, "timeout_after_reject"
                       log("unknown-state (%s) -> treat as sent" % type(e).__name__)
                       return True, "unknown_treated_sent"
               return False, "retry_exhausted"
@@ -403,9 +434,13 @@ jobs:
               lag = -1
               labels = {}
               blocked = 0
+              fails = {}      # id -> 메시지 자체 문제로 거부된 횟수
+              tmo = {}        # id -> 거절 직후 타임아웃 횟수
+              dropped = 0
 
               while time.time() - t0 < RUN_SECONDS:
                   cyc = time.time()
+                  send_failed = False
                   try:
                       fresh = fetch_since(last_id)
                       blocked = 0
@@ -471,7 +506,28 @@ jobs:
                               last_id = max(last_id, iid)
                               write_text(F_LAST_ID, str(last_id))
                           else:
-                              log("send failed (%s) -> 다음 주기 재시도" % reason)
+                              if reason == "bad400_msg":
+                                  # 이 메시지 하나만의 문제 -> 5회 후 이 건만 버림
+                                  fails[iid] = fails.get(iid, 0) + 1
+                                  if fails[iid] >= 5:
+                                      log("id=%d 메시지 거부 5회 -> 이 건만 건너뜀" % iid)
+                                      dropped += 1
+                                      last_id = max(last_id, iid)
+                                      write_text(F_LAST_ID, str(last_id))
+                                      continue
+                              elif reason == "timeout_after_reject":
+                                  # 전달 여부 불명이 반복 -> 무한 재시도하면 중복 폭탄
+                                  tmo[iid] = tmo.get(iid, 0) + 1
+                                  if tmo[iid] >= MAX_TIMEOUT_RETRY:
+                                      log("id=%d 불명 타임아웃 %d회 -> 중복 방지 위해 "
+                                          "보낸 것으로 간주" % (iid, tmo[iid]))
+                                      dropped += 1
+                                      last_id = max(last_id, iid)
+                                      write_text(F_LAST_ID, str(last_id))
+                                      continue
+                              # 설정 오류(bad400_cfg/auth_401)는 절대 건너뛰지 않는다
+                              log("send failed (%s) -> last_id 유지, 재시도" % reason)
+                              send_failed = True
                               break
                           try:
                               lag = int(time.time() - float(it.get("display_time") or 0))
@@ -488,11 +544,17 @@ jobs:
                   if time.time() - tc > COMMIT_EVERY:
                       save_sent(sent)
                       heartbeat(last_id=last_id, send="%d건" % total, reason=reason,
-                                lag=lag,
+                                lag=lag, rejects=_reject_streak, dropped=dropped,
                                 labels=",".join("%s:%s" % kv
                                                 for kv in sorted(labels.items())) or "-")
                       commit_state()
                       tc = time.time()
+
+                  if send_failed:
+                      # 1초 간격으로 계속 두드리면 텔레그램에 수천 건 실패요청이 감
+                      log("전송 실패 -> %d초 대기 후 재시도" % SEND_BACKOFF)
+                      time.sleep(SEND_BACKOFF)
+                      continue
 
                   el = time.time() - cyc
                   if el < POLL_INTERVAL:
@@ -500,6 +562,7 @@ jobs:
 
               save_sent(sent)
               heartbeat(last_id=last_id, send="%d건" % total, reason=reason, lag=lag,
+                        rejects=_reject_streak, dropped=dropped,
                         labels=",".join("%s:%s" % kv
                                         for kv in sorted(labels.items())) or "-",
                         exit="normal")
@@ -538,8 +601,9 @@ jobs:
           done
 
       # 주 방식: 끝나기 직전 스스로 다음 잡 호출 (cron을 믿지 않음)
+      # always() 를 쓰면 취소해도 되살아나므로 success/failure 만
       - name: Chain next run
-        if: always() && github.event.inputs.init_only != '1'
+        if: (success() || failure()) && github.event.inputs.init_only != '1'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: gh workflow run wscn.yml --ref main -f init_only=0 || echo "chain failed"
