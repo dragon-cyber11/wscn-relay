@@ -144,6 +144,38 @@ jobs:
                "Sec-Fetch-Site": "same-site"},
           ]
 
+          # ── 개별종목 공시 걸러내기 ──
+          # 원칙: 절대 진짜 뉴스를 버리지 않는다. 애매하면 통과시킨다.
+          FILTER_NOISE = os.environ.get("FILTER_NOISE", "1") == "1"
+          # 회사 공시에서만 쓰이는 표현 -> 무조건 차단
+          NOISE_STRONG = re.compile(
+              r"中签|回购(公司)?股份|股份回购|全资子公司|控股股东|股权激励|"
+              r"限售股|解禁|质押|停牌|复牌|定向增发|配股|业绩(预告|快报)|扭亏为盈|"
+              r"量化私募|私募.{0,8}(回血|净值|涨超)")
+          # 거시 뉴스에도 쓰일 수 있는 표현 -> "회사명：" 으로 시작할 때만 차단
+          NOISE_WEAK = re.compile(
+              r"净利润|营业收入|营收|拟投资|拟收购|中标|订单|产能|澄清|传闻|"
+              r"价格上调|上调.{0,6}价格|额度|全面升级|重置|用户数|增持|减持|减仓")
+          # 콜론 앞이 이것들이면 회사가 아니라 인물/기관 -> 차단 대상 아님
+          NOT_COMPANY = ("特朗普", "拜登", "普京", "报道", "知情人士", "消息人士",
+                         "分析师", "防长", "外长", "总统", "总理", "部长", "主席",
+                         "行长", "央行", "美联储", "白宫", "欧盟", "商务部", "外交部",
+                         "财政部", "国防部", "统计局", "发言人", "国务院", "日本央行",
+                         "欧洲央行", "传媒", "媒体")
+          COLON_RE = re.compile(r"^([^\s：:]{2,14})[：:]")
+
+          def noise_reason(t):
+              """잡음이면 (True, 사유). 아니면 (False, '')"""
+              if not FILTER_NOISE:
+                  return False, ""
+              if NOISE_STRONG.search(t):
+                  return True, "disclosure"
+              m = COLON_RE.match(t)
+              if m and not any(x in m.group(1) for x in NOT_COMPANY) \
+                     and NOISE_WEAK.search(t):
+                  return True, "company"
+              return False, ""
+
           # 🚨 판정: 제목 맨 앞의 【라벨】 이 속보성이면 사이렌
           BREAKING_LABELS = ["突发", "快讯", "重磅", "独家", "紧急", "刚刚", "爆"]
           LABEL_RE = re.compile(r"^\s*[【\[]\s*([^】\]]{1,12})\s*[】\]]")
@@ -404,8 +436,8 @@ jobs:
               os.makedirs(STATE_DIR, exist_ok=True)
               last_id = int(read_text(F_LAST_ID, "0") or "0")
               sent = load_sent()
-              log("start ch=%s last_id=%s run=%ds init=%s"
-                  % (CHANNEL, last_id, RUN_SECONDS, INIT_ONLY))
+              log("start ch=%s last_id=%s run=%ds init=%s filter=%s"
+                  % (CHANNEL, last_id, RUN_SECONDS, INIT_ONLY, FILTER_NOISE))
 
               if last_id == 0 or INIT_ONLY:
                   for att in range(1, 6):
@@ -437,6 +469,7 @@ jobs:
               fails = {}      # id -> 메시지 자체 문제로 거부된 횟수
               tmo = {}        # id -> 거절 직후 타임아웃 횟수
               dropped = 0
+              filt = {}       # 필터 사유별 건수
 
               while time.time() - t0 < RUN_SECONDS:
                   cyc = time.time()
@@ -479,6 +512,14 @@ jobs:
                           key = head[:120]
                           if key in sent:
                               last_id = max(last_id, iid)
+                              continue
+
+                          nz, why = noise_reason(head)
+                          if nz:
+                              filt[why] = filt.get(why, 0) + 1
+                              log("[필터/%s] %s" % (why, head[:44]))
+                              last_id = max(last_id, iid)
+                              write_text(F_LAST_ID, str(last_id))
                               continue
 
                           lab = label_of(head)
@@ -545,6 +586,8 @@ jobs:
                       save_sent(sent)
                       heartbeat(last_id=last_id, send="%d건" % total, reason=reason,
                                 lag=lag, rejects=_reject_streak, dropped=dropped,
+                                filtered=",".join("%s:%s" % kv
+                                                  for kv in sorted(filt.items())) or "0",
                                 labels=",".join("%s:%s" % kv
                                                 for kv in sorted(labels.items())) or "-")
                       commit_state()
@@ -563,6 +606,8 @@ jobs:
               save_sent(sent)
               heartbeat(last_id=last_id, send="%d건" % total, reason=reason, lag=lag,
                         rejects=_reject_streak, dropped=dropped,
+                        filtered=",".join("%s:%s" % kv
+                                          for kv in sorted(filt.items())) or "0",
                         labels=",".join("%s:%s" % kv
                                         for kv in sorted(labels.items())) or "-",
                         exit="normal")
@@ -580,6 +625,7 @@ jobs:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           WSCN_CHANNEL: global
+          FILTER_NOISE: "1"     # 0 으로 두면 필터 끄고 전부 받음
           INIT_ONLY: ${{ github.event.inputs.init_only }}
         run: |
           set +e
