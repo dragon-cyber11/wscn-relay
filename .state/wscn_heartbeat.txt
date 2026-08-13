@@ -1,1 +1,1 @@
-at=2026-08-13 19:50:23 KST last_id=3149126 send=0건 reason=ok lag=-1 rejects=0 dropped=0 filtered=company:2 labels=- exit=normal
+at=2026-08-13 20:00:27 KST last_id=3149126 send=0건 reason=ok lag=-1 rejects=0 dropped=0 filtered=0 labels=-
