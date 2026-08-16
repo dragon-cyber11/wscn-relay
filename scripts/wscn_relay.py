@@ -89,6 +89,22 @@ NOT_COMPANY = ("特朗普", "拜登", "普京", "报道", "知情人士", "消�
                "欧洲央行", "传媒", "媒体")
 COLON_RE = re.compile(r"^([^\s：:]{2,14})[：:]")
 
+# ── 기업 뉴스 광역 차단 ──
+# "회사가 주어인 뉴스"는 종목이 아니라 시장을 보는 용도에 불필요하다.
+# 콜론 접두를 곧바로 회사로 간주하면 "伊朗官员：", "北京：", "万斯：" 같은
+# 지정학·정책 뉴스가 같이 죽는다(실측 43건 중 6건 오탐). 그래서 접두만으로
+# 판단하지 않고, 회사라는 적극적 증거(종목코드 / 회사 접미사)를 요구한다.
+TICKER_RE = re.compile(r"[（(]\s*\d{4,6}\.(SH|SZ|BJ|HK)\s*[）)]")
+# 주의: 能源·银行 등 일반 업종어가 들어 있어 기관명도 걸린다.
+#   예) 美国能源信息署（EIA）：원유 생산량 전망, 中小银行 금리인상
+#   운영상 감수하기로 한 오탐이다. 되살리려면 해당 단어를 빼면 된다.
+CORP_SFX = re.compile(
+    r"集团|股份|控股|有限公司|科技|半导体|电子|汽车|生物|制药|医药|能源|电力|"
+    r"地产|置业|航空|重工|钢铁|化工|通信|传媒|证券|保险|基金|银行|资本|实业|"
+    r"材料|新材|光电|智能|网络|软件|锂业|矿业|时代|电池|股价")
+# 회사명 추출용. 기존 COLON_RE 보다 넓게 잡는다(따옴표·괄호 포함 사명 대응).
+COLON_WIDE = re.compile(r"^([^\s：:]{2,24})[：:]")
+
 
 def noise_reason(t):
     """잡음이면 (True, 사유). 아니면 (False, '')"""
@@ -100,6 +116,12 @@ def noise_reason(t):
     if m and not any(x in m.group(1) for x in NOT_COMPANY) \
            and NOISE_WEAK.search(t):
         return True, "company"
+    if TICKER_RE.search(t):
+        return True, "ticker"
+    m = COLON_WIDE.match(t)
+    head = m.group(1) if m else t[:14]
+    if not any(x in head for x in NOT_COMPANY) and CORP_SFX.search(head):
+        return True, "corp"
     return False, ""
 
 
