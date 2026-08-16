@@ -1,7 +1,14 @@
 name: probe
 
+# 접근 경로 진단 전용. 시크릿을 쓰지 않으며 결과를 출력만 한다.
+# 주의: 아래 3번 항목은 통제 불가능한 제3자 프록시를 경유한다.
+# 여기서 진단용으로 확인하는 것은 괜찮지만, 이 경로를 릴레이 본체(wscn.yml)의
+# 폴백으로 넣지 말 것 — 제3자가 반환한 내용이 그대로 텔레그램으로 중계된다.
 on:
   workflow_dispatch:
+
+permissions:
+  contents: read
 
 jobs:
   probe:

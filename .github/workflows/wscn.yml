@@ -10,9 +10,9 @@ on:
   schedule:
     - cron: "*/20 * * * *"
 
+# 기본은 읽기만. 필요한 권한은 잡별로 최소한만 올린다.
 permissions:
-  contents: write
-  actions: write
+  contents: read
 
 jobs:
   # ── 감시견: 20분마다 하트비트 확인, 30분 무응답이면 릴레이 재시작 ──
@@ -20,6 +20,9 @@ jobs:
     if: github.event_name == 'schedule'
     runs-on: ubuntu-latest
     timeout-minutes: 5
+    permissions:
+      contents: read      # 체크아웃만
+      actions: write      # 멎은 릴레이 취소 + 새 릴레이 호출
     # 릴레이와 다른 그룹이어야 릴레이가 도는 동안에도 감시견이 실행됨
     concurrency:
       group: wscn-watchdog
@@ -36,31 +39,67 @@ jobs:
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
+          set -u
           HB=.state/wscn_heartbeat.txt
           STALE=1
+          NOTIFY=1          # 하트비트 파일 자체가 없으면 무조건 알린다
+          AGE=0
           if [ -f "$HB" ]; then
             cat "$HB"
             LAST=$(git log -1 --format=%ct -- "$HB")
             AGE=$(( $(date +%s) - ${LAST:-0} ))
             echo "heartbeat age = ${AGE}s"
             [ "$AGE" -le 1800 ] && STALE=0
+            # 무응답이 길어지면 20분마다 같은 경고가 쏟아진다.
+            # 최초 감지(임계 30분 직후 한 틱) + 이후 1시간에 한 번만 알린다.
+            if [ "$AGE" -lt 3000 ] || [ $(( AGE % 3600 )) -lt 1200 ]; then
+              NOTIFY=1
+            else
+              NOTIFY=0
+            fi
           else
             echo "no heartbeat file"
           fi
-          if [ "$STALE" = "1" ]; then
+
+          if [ "$STALE" = "0" ]; then
+            echo "alive, nothing to do"
+            exit 0
+          fi
+
+          if [ "$NOTIFY" = "1" ]; then
             curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
               -d chat_id="${TELEGRAM_CHAT_ID}" \
-              -d text="🐕 wscn 릴레이 무응답 — 감시견이 재시작합니다" >/dev/null || true
-            gh workflow run wscn.yml --ref main -f init_only=0
+              -d text="🐕 wscn 릴레이 무응답(${AGE}초) — 감시견이 재시작합니다" >/dev/null || true
           else
-            echo "alive, nothing to do"
+            echo "alert suppressed (cooldown)"
           fi
+
+          # 릴레이는 concurrency 그룹으로 직렬화된다. 멎은 잡을 먼저 취소하지 않으면
+          # 새로 dispatch 해봐야 pending 큐에서 최대 6시간 대기만 하다 끝난다.
+          # (같은 워크플로 파일이라 감시견 자기 자신도 목록에 나오므로 반드시 제외)
+          RUNNING=$(gh run list --workflow=wscn.yml --status=in_progress \
+                      --limit 30 --json databaseId \
+                    | jq -r --arg me "${GITHUB_RUN_ID}" \
+                        '.[] | select((.databaseId|tostring) != $me) | .databaseId')
+          for id in $RUNNING; do
+            echo "cancel stuck relay run $id"
+            gh run cancel "$id" || true
+          done
+          if [ -n "$RUNNING" ]; then
+            echo "waiting for cancellation to settle..."
+            sleep 20
+          fi
+
+          gh workflow run wscn.yml --ref main -f init_only=0
 
   # ── 릴레이 본체: 5시간 50분 돌고 스스로 다음 잡 호출 ──
   relay:
     if: github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     timeout-minutes: 355
+    permissions:
+      contents: write     # .state 커밋/푸시
+      actions: write      # 다음 잡 체이닝
     # 릴레이는 절대 두 개가 동시에 돌면 안 됨 (중복 발송)
     concurrency:
       group: wscn-relay
@@ -83,542 +122,8 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Write relay script
-        run: |
-          mkdir -p scripts .state
-          cat > scripts/wscn_relay.py <<'PYEOF'
-          #!/usr/bin/env python3
-          # -*- coding: utf-8 -*-
-          """华尔街见闻 7x24 快讯 -> 텔레그램. 속보(lives)만 중계."""
-
-          import json, os, re, subprocess, sys, time
-          import urllib.parse, urllib.request
-          from datetime import datetime, timedelta, timezone
-
-          HOSTS = ["https://api-one.wallstcn.com", "https://api.wallstcn.com"]
-          CHANNEL = os.environ.get("WSCN_CHANNEL", "global")
-          BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
-          CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
-
-          RUN_SECONDS = int(os.environ.get("RUN_SECONDS", "600"))
-          POLL_INTERVAL = float(os.environ.get("POLL_INTERVAL", "1.0"))
-          COMMIT_EVERY = int(os.environ.get("COMMIT_EVERY", "600"))
-          INIT_ONLY = os.environ.get("INIT_ONLY", "0") == "1"
-
-          STATE_DIR = ".state"
-          F_LAST_ID = STATE_DIR + "/wscn_last_id.txt"
-          F_HEARTBEAT = STATE_DIR + "/wscn_heartbeat.txt"
-          F_SENT = STATE_DIR + "/wscn_sent_titles.json"
-
-          KST = timezone(timedelta(hours=9))
-          SEND_GAP = 3.5
-          MAX_PER_CYCLE = 18
-          TITLE_MAX = 1200
-          BACKFILL_MAX = 200
-          STALL_ALERT_SEC = 300
-          SEND_BACKOFF = 30       # 전송 실패 후 다음 시도까지 (핫루프 방지)
-          MAX_TIMEOUT_RETRY = 3   # 거절 직후 타임아웃 재시도 상한 (중복 폭탄 방지)
-          UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-                "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36")
-
-          # 400 중 "설정이 틀렸다"는 것들 — 절대 뉴스를 버리면 안 되고 무한 재시도
-          CONFIG_400 = ("chat not found", "not a member", "not enough rights",
-                        "chat_id is empty", "bot was blocked", "bot was kicked",
-                        "chat is deactivated", "have no rights", "user is deactivated")
-          _reject_streak = 0   # 연속으로 명시적 거절을 받은 횟수
-
-          class Blocked(Exception):
-              """모든 경로가 403 — 러너 IP가 차단됨. 잡을 끝내고 새 러너를 받아야 함."""
-
-          HDRS = [
-              {"Accept": "application/json, text/plain, */*",
-               "Referer": "https://wallstreetcn.com/live/global",
-               "Origin": "https://wallstreetcn.com"},
-              {"Accept": "application/json, text/plain, */*",
-               "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
-               "Referer": "https://wallstreetcn.com/"},
-              {"Accept": "application/json, text/plain, */*",
-               "Accept-Language": "zh-CN,zh;q=0.9",
-               "Referer": "https://wallstreetcn.com/",
-               "Sec-Fetch-Dest": "empty", "Sec-Fetch-Mode": "cors",
-               "Sec-Fetch-Site": "same-site"},
-          ]
-
-          # ── 개별종목 공시 걸러내기 ──
-          # 원칙: 절대 진짜 뉴스를 버리지 않는다. 애매하면 통과시킨다.
-          FILTER_NOISE = os.environ.get("FILTER_NOISE", "1") == "1"
-          # 회사 공시에서만 쓰이는 표현 -> 무조건 차단
-          NOISE_STRONG = re.compile(
-              r"中签|回购(公司)?股份|股份回购|全资子公司|控股股东|股权激励|"
-              r"限售股|解禁|质押|停牌|复牌|定向增发|配股|业绩(预告|快报)|扭亏为盈|"
-              r"量化私募|私募.{0,8}(回血|净值|涨超)")
-          # 거시 뉴스에도 쓰일 수 있는 표현 -> "회사명：" 으로 시작할 때만 차단
-          NOISE_WEAK = re.compile(
-              r"净利润|营业收入|营收|拟投资|拟收购|中标|订单|产能|澄清|传闻|"
-              r"价格上调|上调.{0,6}价格|额度|全面升级|重置|用户数|增持|减持|减仓")
-          # 콜론 앞이 이것들이면 회사가 아니라 인물/기관 -> 차단 대상 아님
-          NOT_COMPANY = ("特朗普", "拜登", "普京", "报道", "知情人士", "消息人士",
-                         "分析师", "防长", "外长", "总统", "总理", "部长", "主席",
-                         "行长", "央行", "美联储", "白宫", "欧盟", "商务部", "外交部",
-                         "财政部", "国防部", "统计局", "发言人", "国务院", "日本央行",
-                         "欧洲央行", "传媒", "媒体")
-          COLON_RE = re.compile(r"^([^\s：:]{2,14})[：:]")
-
-          def noise_reason(t):
-              """잡음이면 (True, 사유). 아니면 (False, '')"""
-              if not FILTER_NOISE:
-                  return False, ""
-              if NOISE_STRONG.search(t):
-                  return True, "disclosure"
-              m = COLON_RE.match(t)
-              if m and not any(x in m.group(1) for x in NOT_COMPANY) \
-                     and NOISE_WEAK.search(t):
-                  return True, "company"
-              return False, ""
-
-          # 🚨 판정: 제목 맨 앞의 【라벨】 이 속보성이면 사이렌
-          BREAKING_LABELS = ["突发", "快讯", "重磅", "独家", "紧急", "刚刚", "爆"]
-          LABEL_RE = re.compile(r"^\s*[【\[]\s*([^】\]]{1,12})\s*[】\]]")
-
-          def log(m):
-              print("[%s] %s" % (datetime.now(KST).strftime("%H:%M:%S"), m), flush=True)
-
-          def http_json(path, timeout=10):
-              """호스트 2개 x 헤더 3종을 번갈아 시도. 전부 403이면 Blocked."""
-              saw_403 = False
-              for host in HOSTS:
-                  for h in HDRS:
-                      hh = {"User-Agent": UA}
-                      hh.update(h)
-                      try:
-                          req = urllib.request.Request(host + path, headers=hh)
-                          with urllib.request.urlopen(req, timeout=timeout) as r:
-                              return json.loads(r.read().decode("utf-8", "replace"))
-                      except urllib.error.HTTPError as e:
-                          if e.code in (403, 429):
-                              saw_403 = True
-                              continue
-                          raise
-                      except Exception:
-                          continue
-              if saw_403:
-                  raise Blocked("all routes 403 (runner IP blocked)")
-              raise RuntimeError("all routes failed")
-
-          def read_text(p, d=""):
-              try:
-                  return open(p, encoding="utf-8").read().strip()
-              except Exception:
-                  return d
-
-          def write_text(p, s):
-              os.makedirs(os.path.dirname(p), exist_ok=True)
-              with open(p, "w", encoding="utf-8") as f:
-                  f.write(s)
-
-          def load_sent():
-              try:
-                  d = json.load(open(F_SENT, encoding="utf-8"))
-                  c = time.time() - 86400
-                  return {k: v for k, v in d.items() if v > c}
-              except Exception:
-                  return {}
-
-          def save_sent(d):
-              c = time.time() - 86400
-              write_text(F_SENT, json.dumps(
-                  {k: v for k, v in d.items() if v > c}, ensure_ascii=False))
-
-          _tr = {}
-          def translate(t):
-              """비공식 구글 번역. 실패하면 원문 반환(봇은 안 멈춤)."""
-              if not t:
-                  return ""
-              k = t[:500]
-              if k in _tr:
-                  return _tr[k]
-              try:
-                  url = ("https://translate.googleapis.com/translate_a/single"
-                         "?client=gtx&sl=zh-CN&tl=ko&dt=t&q="
-                         + urllib.parse.quote(t[:4500]))
-                  req = urllib.request.Request(url, headers={"User-Agent": UA})
-                  with urllib.request.urlopen(req, timeout=8) as r:
-                      d = json.loads(r.read().decode("utf-8", "replace"))
-                  out = "".join(s[0] for s in d[0] if s and s[0]).strip()
-                  if out:
-                      _tr[k] = out
-                      return out
-              except Exception as e:
-                  log("translate fail: %s" % e)
-              return t
-
-          def tg_send(text):
-              """
-              전송 판정 규칙
-                200            -> 성공
-                429            -> 서버가 명시적 거절, 대기 후 재시도
-                400/401        -> 명시적 거절 = 확실히 미전송. 원인을 분류해서 반환
-                응답 없음(타임아웃) -> 전달 여부 불명
-                   - 직전까지 정상이었다면: 중복 폭탄을 피하려고 '보낸 것'으로 간주
-                   - 직전에 명시적 거절이 있었다면: 실패로 간주 (뉴스 유실 방지)
-              """
-              global _reject_streak
-              if not BOT_TOKEN or not CHAT_ID:
-                  return False, "no_credentials"
-              url = "https://api.telegram.org/bot%s/sendMessage" % BOT_TOKEN
-              body = urllib.parse.urlencode({
-                  "chat_id": CHAT_ID, "text": text,
-                  "disable_web_page_preview": "true"}).encode()
-              for _ in range(3):
-                  try:
-                      req = urllib.request.Request(url, data=body, headers={
-                          "Content-Type": "application/x-www-form-urlencoded"})
-                      with urllib.request.urlopen(req, timeout=15) as r:
-                          r.read()
-                          _reject_streak = 0
-                          return True, "ok"
-                  except urllib.error.HTTPError as e:
-                      code = e.code
-                      try:
-                          j = json.loads(e.read().decode("utf-8", "replace"))
-                      except Exception:
-                          j = {}
-                      desc = (j.get("description") or "").lower()
-                      if code == 429:
-                          w = int(j.get("parameters", {}).get("retry_after", 5))
-                          log("429 -> sleep %ds" % w)
-                          time.sleep(min(w + 1, 60))
-                          continue
-                      _reject_streak += 1
-                      if code == 401:
-                          return False, "auth_401"
-                      if code == 400:
-                          kind = "cfg" if any(x in desc for x in CONFIG_400) else "msg"
-                          log("400/%s: %s" % (kind, desc[:80]))
-                          return False, "bad400_%s" % kind
-                      return False, "http_%d" % code
-                  except Exception as e:
-                      if _reject_streak > 0:
-                          # 방금까지 거절당하던 중의 타임아웃 -> 갔을 리 없다
-                          log("timeout (거절 %d회 직후) -> 실패로 처리, 뉴스 보존"
-                              % _reject_streak)
-                          return False, "timeout_after_reject"
-                      log("unknown-state (%s) -> treat as sent" % type(e).__name__)
-                      return True, "unknown_treated_sent"
-              return False, "retry_exhausted"
-
-          def to_kst(dt_val):
-              """실패하면 None. '봇 시각'으로 조용히 대체되지 않게 함."""
-              try:
-                  if isinstance(dt_val, (int, float)):
-                      ts = float(dt_val)
-                  else:
-                      s = str(dt_val).strip()
-                      if re.fullmatch(r"\d+(\.\d+)?", s):
-                          ts = float(s)
-                      else:
-                          m = re.match(
-                              r"(\d{4})-(\d{2})-(\d{2})[T ](\d{2}):(\d{2}):(\d{2})", s)
-                          if not m:
-                              return None
-                          d = datetime(*[int(x) for x in m.groups()], tzinfo=timezone.utc)
-                          return d.astimezone(KST).strftime("%H:%M")
-                  if ts > 1e11:
-                      ts /= 1000.0
-                  return datetime.fromtimestamp(ts, tz=timezone.utc).astimezone(
-                      KST).strftime("%H:%M")
-              except Exception:
-                  return None
-
-          def clean(s):
-              if not s:
-                  return ""
-              s = re.sub(r"<br\s*/?>", "\n", s)
-              s = re.sub(r"</p>", "\n", s)
-              s = re.sub(r"<[^>]+>", "", s)
-              for a, b in [("&nbsp;", " "), ("&amp;", "&"), ("&quot;", '"'),
-                           ("&#34;", '"'), ("&lt;", "<"), ("&gt;", ">")]:
-                  s = s.replace(a, b)
-              return re.sub(r"\n{3,}", "\n\n", s).strip()
-
-          def headline(it):
-              """快讯은 title이 비어있는 경우가 많음 -> content_text 첫 줄로 대체"""
-              t = clean(it.get("title") or "")
-              if not t:
-                  t = clean(it.get("highlight_title") or "")
-              if not t:
-                  t = clean(it.get("content_text") or it.get("content") or "")
-                  t = t.split("\n")[0].strip()
-              return t[:TITLE_MAX]
-
-          def label_of(head):
-              m = LABEL_RE.match(head or "")
-              return m.group(1) if m else None
-
-          def is_breaking(head, it):
-              lab = label_of(head)
-              if lab and any(k in lab for k in BREAKING_LABELS):
-                  return True
-              if (it.get("highlight_title") or "").strip():
-                  return True
-              return False
-
-          def fetch(limit=20, cursor=None):
-              p = ("/apiv1/content/lives?channel=%s&accept=live&limit=%d"
-                   % (CHANNEL, limit))
-              if cursor:
-                  p += "&cursor=%s" % cursor
-              d = http_json(p)
-              if d.get("code") != 20000:
-                  raise RuntimeError("api code=%s" % d.get("code"))
-              dd = d.get("data") or {}
-              items = [x for x in (dd.get("items") or []) if x.get("type") == "live"]
-              return items, dd.get("next_cursor")
-
-          def fetch_since(last_id):
-              """API가 한 번에 20건만 줌 -> 마지막 id 만날 때까지 되짚기(최대 200건)"""
-              out, cursor, seen = [], None, set()
-              while len(out) < BACKFILL_MAX:
-                  items, nxt = fetch(20, cursor)
-                  if not items:
-                      break
-                  hit = False
-                  for it in items:
-                      i = int(it.get("id") or 0)
-                      if i in seen:
-                          continue
-                      seen.add(i)
-                      if last_id and i <= last_id:
-                          hit = True
-                          break
-                      out.append(it)
-                  if hit or not nxt or not last_id:
-                      break
-                  cursor = nxt
-              out.sort(key=lambda x: int(x.get("id") or 0))
-              return out
-
-          def git(*a):
-              try:
-                  return subprocess.run(["git"] + list(a), capture_output=True,
-                                        text=True, timeout=60)
-              except Exception as e:
-                  log("git error: %s" % e)
-                  return None
-
-          def commit_state():
-              """rebase 쓰면 충돌로 커밋이 영원히 안 올라감 -> reset --mixed 방식"""
-              git("add", "-A", STATE_DIR)
-              r = git("diff", "--cached", "--quiet")
-              if r is not None and r.returncode == 0:
-                  return
-              stamp = datetime.now(KST).strftime("%m-%d %H:%M")
-              cid = ["-c", "user.name=wscn-relay", "-c", "user.email=relay@local"]
-              git(*(cid + ["commit", "-m", "state: wscn %s" % stamp]))
-              p = git("push", "origin", "HEAD:main")
-              if p is not None and p.returncode != 0:
-                  log("push conflict -> fetch + reset --mixed")
-                  git("fetch", "origin", "main")
-                  git("reset", "--mixed", "origin/main")
-                  git("add", "-A", STATE_DIR)
-                  git(*(cid + ["commit", "-m", "state: wscn resync %s" % stamp]))
-                  git("push", "origin", "HEAD:main")
-
-          def heartbeat(**kw):
-              p = ["at=%s" % datetime.now(KST).strftime("%Y-%m-%d %H:%M:%S KST")]
-              p += ["%s=%s" % (k, v) for k, v in kw.items()]
-              write_text(F_HEARTBEAT, " ".join(p) + "\n")
-
-          def main():
-              if not BOT_TOKEN or not CHAT_ID:
-                  log("FATAL: TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID 미설정")
-                  return 1
-              os.makedirs(STATE_DIR, exist_ok=True)
-              last_id = int(read_text(F_LAST_ID, "0") or "0")
-              sent = load_sent()
-              log("start ch=%s last_id=%s run=%ds init=%s filter=%s"
-                  % (CHANNEL, last_id, RUN_SECONDS, INIT_ONLY, FILTER_NOISE))
-
-              if last_id == 0 or INIT_ONLY:
-                  for att in range(1, 6):
-                      try:
-                          items, _ = fetch(20)
-                          if items:
-                              newest = max(int(x.get("id") or 0) for x in items)
-                              write_text(F_LAST_ID, str(newest))
-                              heartbeat(mode="init", last_id=newest, send="0(init)")
-                              commit_state()
-                              log("INIT done last_id=%d (전송 안 함)" % newest)
-                              return 0
-                          log("INIT empty items (%d/5)" % att)
-                      except Blocked as e:
-                          log("INIT blocked: %s -> 러너 교체 필요" % e)
-                          return 2
-                      except Exception as e:
-                          log("INIT failed (%d/5): %s" % (att, e))
-                      time.sleep(3)
-                  return 1
-
-              t0 = tc = tn = time.time()
-              alerted = False
-              total = 0
-              reason = "ok"
-              lag = -1
-              labels = {}
-              blocked = 0
-              fails = {}      # id -> 메시지 자체 문제로 거부된 횟수
-              tmo = {}        # id -> 거절 직후 타임아웃 횟수
-              dropped = 0
-              filt = {}       # 필터 사유별 건수
-
-              while time.time() - t0 < RUN_SECONDS:
-                  cyc = time.time()
-                  send_failed = False
-                  try:
-                      fresh = fetch_since(last_id)
-                      blocked = 0
-                  except Blocked as e:
-                      blocked += 1
-                      reason = "blocked_403"
-                      log("blocked %d/10: %s" % (blocked, e))
-                      if blocked >= 10:
-                          heartbeat(last_id=last_id, send="%d건" % total,
-                                    reason="blocked_403", exit="reroll_runner")
-                          commit_state()
-                          tg_send("⚠️ 华尔街见闻 API 403 차단 — 러너를 교체합니다")
-                          return 2
-                      time.sleep(10)
-                      continue
-                  except Exception as e:
-                      reason = "fetch_error:%s" % type(e).__name__
-                      log("fetch error: %s" % e)
-                      time.sleep(min(POLL_INTERVAL * 5, 10))
-                      continue
-
-                  if fresh:
-                      tn = time.time()
-                      if alerted:
-                          tg_send("✅ 华尔街见闻 속보 피드 복구됨")
-                          alerted = False
-                      n = 0
-                      for it in fresh:
-                          if n >= MAX_PER_CYCLE:
-                              break
-                          iid = int(it.get("id") or 0)
-                          head = headline(it)
-                          if not head:
-                              last_id = max(last_id, iid)
-                              continue
-                          key = head[:120]
-                          if key in sent:
-                              last_id = max(last_id, iid)
-                              continue
-
-                          nz, why = noise_reason(head)
-                          if nz:
-                              filt[why] = filt.get(why, 0) + 1
-                              log("[필터/%s] %s" % (why, head[:44]))
-                              last_id = max(last_id, iid)
-                              write_text(F_LAST_ID, str(last_id))
-                              continue
-
-                          lab = label_of(head)
-                          if lab:
-                              labels[lab] = labels.get(lab, 0) + 1
-
-                          ko = translate(head)
-                          hhmm = to_kst(it.get("display_time"))
-                          mark = "🚨 " if is_breaking(head, it) else ""
-
-                          lines = ["%s%s" % (mark, ko)]
-                          if ko.strip() != head.strip():
-                              lines.append("(원문: %s)" % head)
-                          if hhmm:
-                              lines.append("(%s)" % hhmm)
-                          msg = "\n".join(lines)
-                          if len(msg) > 4000:
-                              msg = msg[:3990] + "…"
-
-                          ok, reason = tg_send(msg)
-                          if ok:
-                              sent[key] = time.time()
-                              total += 1
-                              n += 1
-                              last_id = max(last_id, iid)
-                              write_text(F_LAST_ID, str(last_id))
-                          else:
-                              if reason == "bad400_msg":
-                                  # 이 메시지 하나만의 문제 -> 5회 후 이 건만 버림
-                                  fails[iid] = fails.get(iid, 0) + 1
-                                  if fails[iid] >= 5:
-                                      log("id=%d 메시지 거부 5회 -> 이 건만 건너뜀" % iid)
-                                      dropped += 1
-                                      last_id = max(last_id, iid)
-                                      write_text(F_LAST_ID, str(last_id))
-                                      continue
-                              elif reason == "timeout_after_reject":
-                                  # 전달 여부 불명이 반복 -> 무한 재시도하면 중복 폭탄
-                                  tmo[iid] = tmo.get(iid, 0) + 1
-                                  if tmo[iid] >= MAX_TIMEOUT_RETRY:
-                                      log("id=%d 불명 타임아웃 %d회 -> 중복 방지 위해 "
-                                          "보낸 것으로 간주" % (iid, tmo[iid]))
-                                      dropped += 1
-                                      last_id = max(last_id, iid)
-                                      write_text(F_LAST_ID, str(last_id))
-                                      continue
-                              # 설정 오류(bad400_cfg/auth_401)는 절대 건너뛰지 않는다
-                              log("send failed (%s) -> last_id 유지, 재시도" % reason)
-                              send_failed = True
-                              break
-                          try:
-                              lag = int(time.time() - float(it.get("display_time") or 0))
-                          except Exception:
-                              lag = -1
-                          time.sleep(SEND_GAP)
-
-                  if (not alerted) and (time.time() - tn > STALL_ALERT_SEC) and (
-                          reason.startswith("fetch_error") or reason.startswith("http_")):
-                      tg_send("⚠️ 华尔街见闻 속보 피드 이상 (%s) — %d분째 신규 없음"
-                              % (reason, int((time.time() - tn) / 60)))
-                      alerted = True
-
-                  if time.time() - tc > COMMIT_EVERY:
-                      save_sent(sent)
-                      heartbeat(last_id=last_id, send="%d건" % total, reason=reason,
-                                lag=lag, rejects=_reject_streak, dropped=dropped,
-                                filtered=",".join("%s:%s" % kv
-                                                  for kv in sorted(filt.items())) or "0",
-                                labels=",".join("%s:%s" % kv
-                                                for kv in sorted(labels.items())) or "-")
-                      commit_state()
-                      tc = time.time()
-
-                  if send_failed:
-                      # 1초 간격으로 계속 두드리면 텔레그램에 수천 건 실패요청이 감
-                      log("전송 실패 -> %d초 대기 후 재시도" % SEND_BACKOFF)
-                      time.sleep(SEND_BACKOFF)
-                      continue
-
-                  el = time.time() - cyc
-                  if el < POLL_INTERVAL:
-                      time.sleep(POLL_INTERVAL - el)
-
-              save_sent(sent)
-              heartbeat(last_id=last_id, send="%d건" % total, reason=reason, lag=lag,
-                        rejects=_reject_streak, dropped=dropped,
-                        filtered=",".join("%s:%s" % kv
-                                          for kv in sorted(filt.items())) or "0",
-                        labels=",".join("%s:%s" % kv
-                                        for kv in sorted(labels.items())) or "-",
-                        exit="normal")
-              commit_state()
-              log("done sent=%d last_id=%d" % (total, last_id))
-              return 0
-
-          if __name__ == "__main__":
-              sys.exit(main())
-          PYEOF
-          python3 -m py_compile scripts/wscn_relay.py && echo "script OK"
+      - name: Syntax check
+        run: python3 -m py_compile scripts/wscn_relay.py && echo "script OK"
 
       - name: Run relay
         env:
@@ -626,7 +131,10 @@ jobs:
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           WSCN_CHANNEL: global
           FILTER_NOISE: "1"     # 0 으로 두면 필터 끄고 전부 받음
-          INIT_ONLY: ${{ github.event.inputs.init_only }}
+          INIT_ONLY: ${{ inputs.init_only }}
+          # 403 차단으로 잡을 끝낼 때 이만큼 쉬었다 나간다.
+          # 즉시 나가면 체인이 곧바로 새 잡을 띄워 시간당 30회씩 재시작한다.
+          BLOCK_COOLDOWN: "300"
         run: |
           set +e
           if [ "$INIT_ONLY" = "1" ]; then
@@ -639,7 +147,8 @@ jobs:
             RUN_SECONDS=600 python3 scripts/wscn_relay.py
             RC=$?
             if [ "$RC" = "2" ]; then
-              echo "=== runner IP blocked (403) -> 잡을 끝내고 새 러너를 받는다 ==="
+              echo "=== runner IP blocked (403) -> ${BLOCK_COOLDOWN}초 대기 후 새 러너를 받는다 ==="
+              sleep "$BLOCK_COOLDOWN"
               break
             fi
             echo "--- cycle ended, restarting ---"
@@ -649,7 +158,7 @@ jobs:
       # 주 방식: 끝나기 직전 스스로 다음 잡 호출 (cron을 믿지 않음)
       # always() 를 쓰면 취소해도 되살아나므로 success/failure 만
       - name: Chain next run
-        if: (success() || failure()) && github.event.inputs.init_only != '1'
+        if: (success() || failure()) && inputs.init_only != '1'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: gh workflow run wscn.yml --ref main -f init_only=0 || echo "chain failed"
