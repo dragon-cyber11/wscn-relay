@@ -32,6 +32,8 @@ STALL_ALERT_SEC = 300
 SEND_BACKOFF = 30           # 전송 실패 후 다음 시도까지 (핫루프 방지)
 MAX_TIMEOUT_RETRY = 3       # 거절 직후 타임아웃 재시도 상한 (중복 폭탄 방지)
 REJECT_WINDOW = 60          # "방금 거절당했다"로 볼 시간 창
+TRANSLATE_TRIES = 3         # gtx 가 간헐적으로 500 을 뱉는다 -> 재시도
+TRANSLATE_BACKOFF = (0.5, 1.5)   # 시도 사이 대기 (길이 = TRANSLATE_TRIES-1)
 BLOCK_ALERT_COOLDOWN = 3600  # 403 차단 경고 재발송 간격
 COMMIT_TAIL_GUARD = 30      # 종료 직전이면 주기 커밋을 건너뛴다 (중복 커밋 방지)
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -182,28 +184,49 @@ def save_sent(d):
 
 
 _tr = {}
+_tr_fail = 0   # 재시도를 다 쓰고도 실패해서 원문으로 나간 건수
 
 
 def translate(t):
-    """비공식 구글 번역. 실패하면 원문 반환(봇은 안 멈춤)."""
+    """
+    비공식 구글 번역. 실패하면 원문 반환(봇은 안 멈춤).
+
+    gtx 는 간헐적으로 500 을 뱉는데 한 번 실패했다고 원문을 그대로 내보내면
+    중국어가 그대로 나간다. 일시적 오류는 재시도하고, 요청 자체가 잘못된
+    4xx 는 재시도해봐야 같은 결과이므로 즉시 포기한다.
+    """
+    global _tr_fail
     if not t:
         return ""
     k = t[:500]
     if k in _tr:
         return _tr[k]
-    try:
-        url = ("https://translate.googleapis.com/translate_a/single"
-               "?client=gtx&sl=zh-CN&tl=ko&dt=t&q="
-               + urllib.parse.quote(t[:4500]))
-        req = urllib.request.Request(url, headers={"User-Agent": UA})
-        with urllib.request.urlopen(req, timeout=8) as r:
-            d = json.loads(r.read().decode("utf-8", "replace"))
-        out = "".join(s[0] for s in d[0] if s and s[0]).strip()
-        if out:
-            _tr[k] = out
-            return out
-    except Exception as e:
-        log("translate fail: %s" % e)
+    url = ("https://translate.googleapis.com/translate_a/single"
+           "?client=gtx&sl=zh-CN&tl=ko&dt=t&q="
+           + urllib.parse.quote(t[:4500]))
+    last = "unknown"
+    for att in range(1, TRANSLATE_TRIES + 1):
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": UA})
+            with urllib.request.urlopen(req, timeout=8) as r:
+                d = json.loads(r.read().decode("utf-8", "replace"))
+            out = "".join(s[0] for s in d[0] if s and s[0]).strip()
+            if out:
+                if att > 1:
+                    log("translate ok (%d회째 시도)" % att)
+                _tr[k] = out
+                return out
+            last = "empty response"
+        except urllib.error.HTTPError as e:
+            last = "HTTP %d" % e.code
+            if 400 <= e.code < 500 and e.code != 429:
+                break   # 요청 자체 문제 -> 재시도 무의미
+        except Exception as e:
+            last = "%s: %s" % (type(e).__name__, e)
+        if att < TRANSLATE_TRIES:
+            time.sleep(TRANSLATE_BACKOFF[att - 1])
+    _tr_fail += 1
+    log("translate fail (%d회 시도, %s) -> 원문 사용" % (att, last))
     return t
 
 
@@ -626,6 +649,7 @@ def main():
             heartbeat(last_id=last_id, send="%d건" % total, reason=feed_reason,
                       send_reason=send_reason, lag=lag, rejects=_reject_count,
                       dropped=dropped, unconfirmed=unconfirmed,
+                      tr_fail=_tr_fail,
                       filtered=_counts(filt), labels=_counts(labels, "-"))
             commit_state()
             tc = time.time()
@@ -644,6 +668,7 @@ def main():
     heartbeat(last_id=last_id, send="%d건" % total, reason=feed_reason,
               send_reason=send_reason, lag=lag, rejects=_reject_count,
               dropped=dropped, unconfirmed=unconfirmed,
+              tr_fail=_tr_fail,
               filtered=_counts(filt), labels=_counts(labels, "-"),
               exit="normal")
     commit_state()
