@@ -70,9 +70,9 @@ def quote(sym):
     return None
 
 
-# 등락 표시(한국식: 상승 빨강·하락 파랑). 바꾸려면 이 줄만 고치면 된다.
-#   🔺/🔻 빨강 삼각형 · 🟢/🔴 미국식 · ⬆️/⬇️ 화살표
-UP, DOWN, FLAT = "🔴", "🔵", "▪️"
+# 등락 표시. 바꾸려면 이 줄만 고치면 된다.
+#   🔺/🔻 빨강 삼각형 · 🔴/🔵 한국식 · 🟢/🔴 미국식
+UP, DOWN, FLAT = "⬆️", "⬇️", "➡️"
 
 
 def treasury():
@@ -105,17 +105,26 @@ def num(v, nd):
     return format(round(v, nd), ",.%df" % nd)
 
 
+def signed(d, nd, unit):
+    """0 에는 부호를 붙이지 않는다. +0.00% 는 어색하다."""
+    return ("%+.*f%s" if d else "%.*f%s") % (nd, d, unit)
+
+
 def line(name, v, pc, nd):
-    d = (v - pc) / pc * 100.0 if pc else 0.0
+    # 화살표로 방향이 보이지만 부호도 같이 적는다. 숫자만 눈으로 훑을 때
+    # 부호가 없으면 상승·하락이 구분되지 않는다.
+    # 표시할 자리수로 먼저 반올림해야 화살표와 숫자가 어긋나지 않는다
+    # (예: +0.004% 를 그대로 두면 ⬆️0.00% 가 된다).
+    d = round((v - pc) / pc * 100.0, 2) if pc else 0.0
     mark = UP if d > 0 else DOWN if d < 0 else FLAT
-    return "%s %s  %s%.2f%%" % (name, num(v, nd), mark, abs(d))
+    return "%s %s  %s%s" % (name, num(v, nd), mark, signed(d, 2, "%"))
 
 
 def yline(name, v, pc):
     """수익률은 등락률(%)이 아니라 bp 변화가 의미 있다."""
-    bp = (v - pc) * 100.0
+    bp = round((v - pc) * 100.0, 1)
     mark = UP if bp > 0 else DOWN if bp < 0 else FLAT
-    return "%s %.2f%%  %s%.1fbp" % (name, v, mark, abs(bp))
+    return "%s %.2f%%  %s%s" % (name, v, mark, signed(bp, 1, "bp"))
 
 
 def render():
