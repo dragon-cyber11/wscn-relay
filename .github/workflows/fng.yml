@@ -39,6 +39,12 @@ jobs:
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          # 커스텀(프리미엄) 이모지. 저장소 변수 TG_CUSTOM_EMOJI 에
+          #   ⬆️=5368324170671202286,⬇️=5368...
+          # 형식으로 넣으면 켜지고, 비어 있으면 일반 이모지로 나간다.
+          # ID 는 아래로 확인한다(팩 이름은 t.me/addemoji/<이름> 의 <이름>).
+          #   curl -s "https://api.telegram.org/bot<TOKEN>/getStickerSet?name=NewsEmoji"
+          TG_CUSTOM_EMOJI: ${{ vars.TG_CUSTOM_EMOJI }}
           # 수동 실행은 시간대 판정을 건너뛰고 무조건 보낸다.
           FNG_FORCE: ${{ github.event_name == 'workflow_dispatch' && '1' || '0' }}
         run: python3 scripts/fng.py
@@ -51,5 +57,11 @@ jobs:
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          # 커스텀(프리미엄) 이모지. 저장소 변수 TG_CUSTOM_EMOJI 에
+          #   ⬆️=5368324170671202286,⬇️=5368...
+          # 형식으로 넣으면 켜지고, 비어 있으면 일반 이모지로 나간다.
+          # ID 는 아래로 확인한다(팩 이름은 t.me/addemoji/<이름> 의 <이름>).
+          #   curl -s "https://api.telegram.org/bot<TOKEN>/getStickerSet?name=NewsEmoji"
+          TG_CUSTOM_EMOJI: ${{ vars.TG_CUSTOM_EMOJI }}
           FNG_FORCE: ${{ github.event_name == 'workflow_dispatch' && '1' || '0' }}
         run: python3 scripts/market.py

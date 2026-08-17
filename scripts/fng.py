@@ -6,7 +6,7 @@
 영향이 없고, 반대도 마찬가지다.
 """
 
-import json, os, sys, time
+import html, json, os, sys, time
 import urllib.error, urllib.parse, urllib.request
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
@@ -38,6 +38,40 @@ KO = {"extreme fear": "극단적 공포", "fear": "공포", "neutral": "중립",
       "greed": "탐욕", "extreme greed": "극단적 탐욕"}
 EMO = {"extreme fear": "😱", "fear": "😨", "neutral": "😐",
        "greed": "🤑", "extreme greed": "🔥"}
+
+
+def _parse_custom_emoji(raw):
+    """
+    "⬆️=5368324170671202286,⬇️=5368..." 형식을 {문자: id} 로.
+
+    커스텀(프리미엄) 이모지는 봇이 Fragment 에서 유저네임을 샀거나, 봇
+    소유자가 프리미엄이고 private/group/supergroup 으로 직접 보낼 때만
+    쓸 수 있다(공식 문서). 채널은 그 목록에 없으므로 될지는 실제로
+    보내봐야 안다. 그래서 실패하면 일반 이모지로 자동 재시도한다.
+
+    비워두면(기본) 지금까지와 완전히 동일하게 동작한다.
+    """
+    out = {}
+    for part in raw.split(","):
+        if "=" not in part:
+            continue
+        ch, eid = (x.strip() for x in part.split("=", 1))
+        if ch and eid.isdigit():
+            out[ch] = eid
+    return out
+
+
+CUSTOM_EMOJI = _parse_custom_emoji(os.environ.get("TG_CUSTOM_EMOJI", ""))
+
+
+def to_html(text):
+    """평문을 HTML 모드용으로 바꾸고, 설정된 이모지만 커스텀으로 치환한다."""
+    out = html.escape(text)
+    for ch, eid in CUSTOM_EMOJI.items():
+        esc = html.escape(ch)
+        out = out.replace(
+            esc, '<tg-emoji emoji-id="%s">%s</tg-emoji>' % (eid, esc))
+    return out
 
 
 def log(m):
@@ -138,13 +172,25 @@ def tg_send(text):
     if DRY_RUN:
         log("DRY_RUN — 전송 생략")
         print("-" * 46)
-        print(text)
+        print(to_html(text) if CUSTOM_EMOJI else text)
         print("-" * 46)
         return True
+    if CUSTOM_EMOJI:
+        if _post(to_html(text), "HTML"):
+            return True
+        # 커스텀 이모지는 봇/채팅 종류에 따라 거부된다. 메시지를 통째로
+        # 잃는 것보다 일반 이모지로라도 보내는 편이 낫다.
+        log("커스텀 이모지 발송 실패 -> 일반 이모지로 재시도")
+    return _post(text, None)
+
+
+def _post(text, parse_mode):
+    payload = {"chat_id": CHAT_ID, "text": text,
+               "disable_web_page_preview": "true"}
+    if parse_mode:
+        payload["parse_mode"] = parse_mode
     url = "https://api.telegram.org/bot%s/sendMessage" % BOT_TOKEN
-    body = urllib.parse.urlencode({
-        "chat_id": CHAT_ID, "text": text,
-        "disable_web_page_preview": "true"}).encode()
+    body = urllib.parse.urlencode(payload).encode()
     last = "unknown"
     for att in range(1, TRIES + 1):
         try:
