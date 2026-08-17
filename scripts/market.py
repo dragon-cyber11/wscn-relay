@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""미국장 마감 시황 -> 텔레그램. 주요 지수·원자재·금리·환율 한 장.
+"""글로벌 마감 시황 -> 텔레그램. 미국·아시아 지수, 원자재·금리·환율 한 장.
 
 발송 시점 판정(서머타임 포함)과 텔레그램 전송은 fng.py 것을 그대로 쓴다.
 같은 워크플로에서 fng.py 다음에 실행되며, 마감 슬롯에서만 보낸다.
@@ -16,9 +16,16 @@ CHART = "https://query1.finance.yahoo.com/v8/finance/chart/%s?interval=1d&range=
 
 # (야후 티커, 표시명, 소수 자릿수)
 GROUPS = [
-    ("지수", [
+    ("미국", [
         ("^GSPC", "S&P500", 2), ("^IXIC", "나스닥", 2), ("^DJI", "다우", 2),
         ("^RUT", "러셀2000", 2), ("^VIX", "VIX", 2),
+    ]),
+    # 미국장 마감(KST 06:30/07:30) 시점엔 아시아 당일장은 아직 안 열렸다.
+    # 그래서 여기 값은 직전 아시아 세션 종가이고, 위 미국 지수와 같은
+    # 거래일(직전) 마감을 함께 보여주게 된다.
+    ("아시아", [
+        ("000001.SS", "상하이", 2), ("^TWII", "대만가권", 2),
+        ("^N225", "닛케이", 2), ("^KS11", "코스피", 2), ("^HSI", "항셍", 2),
     ]),
     ("원자재", [
         ("CL=F", "WTI", 2), ("BZ=F", "브렌트", 2), ("GC=F", "금", 2),
@@ -42,8 +49,25 @@ TREASURY = ("https://home.treasury.gov/resource-center/data-chart-center/"
 YIELD_COLS = [("2 Yr", "미2년물"), ("10 Yr", "미10년물"), ("30 Yr", "미30년물")]
 
 
+def prev_close(p, closes):
+    """
+    일간 등락용 '직전 세션 종가'를 일봉 종가 배열에서 고른다.
+
+    meta.chartPreviousClose 는 range(5d) 시작 이전 종가(≈5~6일 전)라
+    하루 등락 계산에는 못 쓴다. 예전엔 그걸 써서 등락률이 며칠치로
+    부풀려져 있었다. 배열의 마지막이 현재가와 가장 가까우면 그게 현재
+    세션 종가이므로 직전은 [-2], 장중이라 마지막이 어제 종가면 그게 곧
+    직전 종가이므로 [-1] 을 쓴다.
+    """
+    if len(closes) < 2:
+        return None
+    if p is not None and abs(closes[-1] - p) <= abs(closes[-2] - p):
+        return closes[-2]
+    return closes[-1]
+
+
 def quote(sym):
-    """현재가와 전일 종가. 실패하면 None (그 항목만 빠지고 나머지는 나간다)."""
+    """현재가와 직전 세션 종가. 실패하면 None (그 항목만 빠진다)."""
     url = CHART % urllib.parse.quote(sym)
     last = "unknown"
     for att in range(1, TRIES + 1):
@@ -51,9 +75,16 @@ def quote(sym):
             req = urllib.request.Request(url, headers={"User-Agent": UA})
             with urllib.request.urlopen(req, timeout=15) as r:
                 d = json.loads(r.read().decode("utf-8", "replace"))
-            m = d["chart"]["result"][0]["meta"]
+            res = d["chart"]["result"][0]
+            m = res["meta"]
             p = m.get("regularMarketPrice")
-            pc = m.get("chartPreviousClose") or m.get("previousClose")
+            closes = [c for c in
+                      ((res.get("indicators", {}).get("quote") or [{}])[0]
+                       .get("close") or [])
+                      if c is not None]
+            if p is None and closes:
+                p = closes[-1]
+            pc = prev_close(p, closes)
             if p is None or not pc:
                 last = "필드 없음"
             else:
@@ -164,7 +195,7 @@ def render():
 
     if not got:
         return None, got, miss
-    head = "📊 미국장 마감 시황 — %s" % datetime.now(KST).strftime("%m-%d")
+    head = "📊 글로벌 마감 시황 — %s" % datetime.now(KST).strftime("%m-%d")
     tail = "기준 %s KST" % datetime.now(KST).strftime("%H:%M")
     if miss:
         tail += " · %d개 항목 조회 실패" % miss
