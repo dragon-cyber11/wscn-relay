@@ -108,9 +108,9 @@ def render(j, label="현재"):
     def cmp(name, v):
         d = s - float(v)
         mark = "▲%.1f" % d if d > 0 else "▼%.1f" % abs(d) if d < 0 else "―"
-        # 라벨은 전부 "한글2 + 공백 + 한글1" 로 폭이 같다(아래 호출부 참고).
-        # 한글 음절은 어떤 글꼴에서도 폭이 균일하므로 뒤따르는 숫자가
-        # 같은 위치에서 시작한다. 공백 패딩은 쓰지 않는다.
+        # 라벨은 전부 한글 3음절로 폭이 같다(아래 호출부 참고). 한글 음절은
+        # 어떤 글꼴에서도 폭이 균일하므로 뒤따르는 숫자가 같은 위치에서
+        # 시작한다. 공백 패딩은 쓰지 않는다.
         return "%s %.0f  %s" % (name, float(v), mark)
 
     return "\n".join([
@@ -121,12 +121,12 @@ def render(j, label="현재"):
         # 숫자와 막대가 어긋난다.
         "공포 %s 탐욕" % bar(s),
         "",
-        # 라벨 폭을 맞추려고 전일/1주 전 대신 하루 전/일주 전을 쓴다.
-        # 넷 다 한글 2음절 + " 전" 이라 렌더링 폭이 동일하다.
-        cmp("하루 전", fg["previous_close"]),
-        cmp("일주 전", fg["previous_1_week"]),
-        cmp("한달 전", fg["previous_1_month"]),
-        cmp("일년 전", fg["previous_1_year"]),
+        # 라벨 폭을 맞추려고 전일/1주전 대신 하루전/일주전을 쓴다.
+        # 넷 다 한글 3음절이라 렌더링 폭이 동일하다.
+        cmp("하루전", fg["previous_close"]),
+        cmp("일주전", fg["previous_1_week"]),
+        cmp("한달전", fg["previous_1_month"]),
+        cmp("일년전", fg["previous_1_year"]),
         "",
         # CNN 은 미국 장중에만 갱신한다. 휴장이면 값이 그대로이므로
         # 기준 시각을 항상 붙여서 신선도를 눈으로 확인할 수 있게 한다.
