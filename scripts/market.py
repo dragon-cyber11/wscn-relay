@@ -6,7 +6,7 @@
 같은 워크플로에서 fng.py 다음에 실행되며, 마감 슬롯에서만 보낸다.
 """
 
-import json, sys, time
+import csv, io, json, sys, time
 import urllib.error, urllib.parse, urllib.request
 from datetime import datetime
 
@@ -29,8 +29,17 @@ GROUPS = [
         ("JPY=X", "엔/달러", 2), ("EURUSD=X", "유로/달러", 4),
     ]),
 ]
-# 수익률은 등락률(%)이 아니라 bp 변화가 의미 있으므로 따로 다룬다.
-YIELDS = [("^TNX", "미10년물", 2), ("^FVX", "미5년물", 2)]
+
+# 국채 수익률은 미 재무부 공식 일일 곡선을 쓴다.
+# 야후에는 2년물 현물 지수가 없고, 대체 후보인 2YY=F 는 유동성이 없어
+# 며칠씩 같은 값에 머무른다(실측 08-07~08-13 내내 4.170 고정).
+# 재무부 CSV 는 2/10/30년을 모두 담고 미국 동부시간 오후에 갱신되므로
+# 마감 발송 시각(ET 17:30)과도 맞는다.
+TREASURY = ("https://home.treasury.gov/resource-center/data-chart-center/"
+            "interest-rates/daily-treasury-rates.csv/%d/all"
+            "?type=daily_treasury_yield_curve&field_tdr_date_value=%d"
+            "&page&_format=csv")
+YIELD_COLS = [("2 Yr", "미2년물"), ("10 Yr", "미10년물"), ("30 Yr", "미30년물")]
 
 
 def quote(sym):
@@ -61,9 +70,35 @@ def quote(sym):
     return None
 
 
-# 등락 표시. 다른 조합으로 바꾸려면 이 세 줄만 고치면 된다.
-#   🔴/🔵 한국식(상승 빨강·하락 파랑) · 🟢/🔴 미국식 · ⬆️/⬇️ 화살표
-UP, DOWN, FLAT = "🔺", "🔻", "▪️"
+# 등락 표시(한국식: 상승 빨강·하락 파랑). 바꾸려면 이 줄만 고치면 된다.
+#   🔺/🔻 빨강 삼각형 · 🟢/🔴 미국식 · ⬆️/⬇️ 화살표
+UP, DOWN, FLAT = "🔴", "🔵", "▪️"
+
+
+def treasury():
+    """
+    최근 두 영업일의 국채 수익률 행을 (최신, 직전) 순서로 돌려준다.
+    파일이 연도별이라 연초에는 전년도 것까지 봐야 두 행이 채워진다.
+    """
+    rows = []
+    year = datetime.now(KST).year
+    for y in (year, year - 1):
+        url = TREASURY % (y, y)
+        for att in range(1, TRIES + 1):
+            try:
+                req = urllib.request.Request(url, headers={"User-Agent": UA})
+                with urllib.request.urlopen(req, timeout=25) as r:
+                    txt = r.read().decode("utf-8", "replace")
+                rows += list(csv.DictReader(io.StringIO(txt)))
+                break
+            except Exception as e:
+                if att == TRIES:
+                    log("재무부 %d년 조회 실패 (%s)" % (y, str(e)[:40]))
+                else:
+                    time.sleep(BACKOFF[att - 1])
+        if len(rows) >= 2:
+            break
+    return rows[:2]
 
 
 def num(v, nd):
@@ -76,10 +111,11 @@ def line(name, v, pc, nd):
     return "%s %s  %s%.2f%%" % (name, num(v, nd), mark, abs(d))
 
 
-def yline(name, v, pc, nd):
+def yline(name, v, pc):
+    """수익률은 등락률(%)이 아니라 bp 변화가 의미 있다."""
     bp = (v - pc) * 100.0
     mark = UP if bp > 0 else DOWN if bp < 0 else FLAT
-    return "%s %s%%  %s%.1fbp" % (name, num(v, nd), mark, abs(bp))
+    return "%s %.2f%%  %s%.1fbp" % (name, v, mark, abs(bp))
 
 
 def render():
@@ -98,15 +134,19 @@ def render():
             out.append("[%s]" % title)
             out += body
             out.append("")
+    tr = treasury()
     body = []
-    for sym, name, nd in YIELDS:
-        q = quote(sym)
-        if q is None:
-            miss += 1
-            continue
-        body.append(yline(name, q[0], q[1], nd))
-        got += 1
-        time.sleep(0.2)
+    if len(tr) >= 2:
+        for col, name in YIELD_COLS:
+            try:
+                v, pc = float(tr[0][col]), float(tr[1][col])
+            except (KeyError, TypeError, ValueError):
+                miss += 1
+                continue
+            body.append(yline(name, v, pc))
+            got += 1
+    else:
+        miss += len(YIELD_COLS)
     if body:
         out.append("[금리]")
         out += body
