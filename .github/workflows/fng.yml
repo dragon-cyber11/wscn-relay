@@ -8,11 +8,15 @@ name: fng
 on:
   workflow_dispatch:
   schedule:
-    # UTC 고정이다. 아래 KST/ET 환산은 미국 서머타임(EDT, 3~11월) 기준이고,
-    # 겨울(EST)에는 미국 시각이 1시간 밀린다. cron 문자열을 바꾸면
-    # scripts/fng.py 의 LABELS 도 같이 고쳐야 한다.
-    - cron: "0 16 * * 1-5"     # 장중  = ET 12:00 = KST 01:00 (익일)
-    - cron: "30 20 * * 1-5"    # 마감후 = ET 16:30 = KST 05:30 (익일)
+    # GitHub Actions cron 은 UTC 고정이라 서머타임을 못 따라간다.
+    # 그래서 서머타임(EDT)/표준시(EST) 후보 시각 양쪽에 cron 을 걸어두고,
+    # 실제로 보낼지는 scripts/fng.py 가 뉴욕 현지시각을 보고 정한다.
+    # 계절마다 어느 한쪽만 발송되고 나머지는 조용히 건너뛴다.
+    # 시각을 바꾸려면 fng.py 의 PHASES 와 아래 네 줄을 같이 고친다.
+    - cron: "0 17 * * 1-5"     # 장중 13:00 ET (EDT) — KST 02:00
+    - cron: "0 18 * * 1-5"     # 장중 13:00 ET (EST) — KST 03:00
+    - cron: "30 21 * * 1-5"    # 마감 17:30 ET (EDT) — KST 06:30
+    - cron: "30 22 * * 1-5"    # 마감 17:30 ET (EST) — KST 07:30
 
 permissions:
   contents: read
@@ -35,7 +39,6 @@ jobs:
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-          # 어느 cron 이 깨웠는지 스크립트에 넘겨 라벨을 정한다.
-          # workflow_dispatch 로 돌리면 빈 값이라 "현재" 로 나간다.
-          FNG_SCHEDULE: ${{ github.event.schedule }}
+          # 수동 실행은 시간대 판정을 건너뛰고 무조건 보낸다.
+          FNG_FORCE: ${{ github.event_name == 'workflow_dispatch' && '1' || '0' }}
         run: python3 scripts/fng.py

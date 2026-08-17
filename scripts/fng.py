@@ -9,25 +9,30 @@
 import json, os, sys, time
 import urllib.error, urllib.parse, urllib.request
 from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 
 BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
 CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
-# 워크플로가 넘겨주는 cron 문자열. 어느 발송인지 구분하는 데만 쓴다.
-SCHEDULE = os.environ.get("FNG_SCHEDULE", "").strip()
 DRY_RUN = os.environ.get("FNG_DRY_RUN", "0") == "1"
+# 수동 실행(workflow_dispatch)은 시간대와 무관하게 무조건 보낸다.
+FORCE = os.environ.get("FNG_FORCE", "0") == "1"
 
 URL = "https://production.dataviz.cnn.io/index/fearandgreed/graphdata"
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36")
 KST = timezone(timedelta(hours=9))
+NY = ZoneInfo("America/New_York")
 TRIES = 3
 BACKOFF = (1.0, 3.0)
 
-# cron -> 라벨. 워크플로의 schedule 과 반드시 같이 고쳐야 한다.
-LABELS = {
-    "0 16 * * 1-5": "미국장 장중",
-    "30 20 * * 1-5": "미국장 마감",
-}
+# 뉴욕 현지시각 기준 발송 시점. 서머타임은 zoneinfo 가 알아서 처리하므로
+# cron 을 계절마다 고칠 필요가 없다.
+#   장중 13:00 ET — 개장 3시간 30분 뒤, 오전 변동성이 가라앉은 시점
+#   마감 17:30 ET — 마감 1시간 30분 뒤, CNN 종가 반영이 끝난 뒤
+PHASES = ((13, 0, "미국장 장중"), (17, 30, "미국장 마감"))
+# cron 지연을 흡수하는 창. 두 후보 cron 이 1시간 간격이라 55분이면
+# 계절에 관계없이 정확히 하나만 창 안에 들어온다.
+WINDOW_MIN = 55
 
 KO = {"extreme fear": "극단적 공포", "fear": "공포", "neutral": "중립",
       "greed": "탐욕", "extreme greed": "극단적 탐욕"}
@@ -37,6 +42,25 @@ EMO = {"extreme fear": "😱", "fear": "😨", "neutral": "😐",
 
 def log(m):
     print("[%s] %s" % (datetime.now(KST).strftime("%H:%M:%S"), m), flush=True)
+
+
+def phase(now=None):
+    """
+    지금이 어느 발송 시점인지 뉴욕 현지시각으로 판정한다.
+    해당 없으면 None — 반대 계절용 cron 이 깨운 경우다.
+
+    워크플로는 서머타임/표준시 후보 시각 양쪽에 cron 을 걸어두고,
+    실제로 보낼지는 여기서 정한다. 목표 시각 이후 WINDOW_MIN 분까지만
+    받아들이므로 cron 이 조금 늦게 떠도 발송되고, 1시간 어긋난 반대
+    계절 cron 은 창 밖이라 조용히 건너뛴다.
+    """
+    et = (now or datetime.now(timezone.utc)).astimezone(NY)
+    for h, m, label in PHASES:
+        target = et.replace(hour=h, minute=m, second=0, microsecond=0)
+        delta = (et - target).total_seconds() / 60.0
+        if 0 <= delta < WINDOW_MIN:
+            return label, et
+    return None, et
 
 
 def fetch():
@@ -66,13 +90,12 @@ def bar(v, n=22):
     return "".join("●" if i == p else "─" for i in range(n))
 
 
-def render(j):
+def render(j, label="현재"):
     fg = j["fear_and_greed"]
     s = float(fg["score"])
     rating = fg["rating"]
     ts = datetime.fromisoformat(fg["timestamp"]).astimezone(KST)
     age = (datetime.now(KST) - ts).total_seconds() / 3600.0
-    label = LABELS.get(SCHEDULE, "현재")
 
     def cmp(name, v):
         return "  %-6s %4.0f  (%+.1f)" % (name, float(v), s - float(v))
@@ -140,14 +163,21 @@ def main():
     if not DRY_RUN and (not BOT_TOKEN or not CHAT_ID):
         log("FATAL: TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID 미설정")
         return 1
+    label, et = phase()
+    if label is None:
+        if not FORCE:
+            # 반대 계절용 cron 이 깨운 것이다. 실패가 아니므로 0 으로 끝낸다.
+            log("발송 시점 아님 (뉴욕 %s) -> 건너뜀" % et.strftime("%m-%d %H:%M %Z"))
+            return 0
+        label = "현재"
     try:
         j = fetch()
     except Exception as e:
         log("FATAL: %s" % e)
         return 1
-    msg = render(j)
-    log("발송: %s / %s" % (LABELS.get(SCHEDULE, "수동"),
-                          msg.split("\n")[2].strip()))
+    msg = render(j, label)
+    log("발송: %s (뉴욕 %s) / %s"
+        % (label, et.strftime("%H:%M %Z"), msg.split("\n")[2].strip()))
     return 0 if tg_send(msg) else 1
 
 
