@@ -42,3 +42,14 @@ jobs:
           # 수동 실행은 시간대 판정을 건너뛰고 무조건 보낸다.
           FNG_FORCE: ${{ github.event_name == 'workflow_dispatch' && '1' || '0' }}
         run: python3 scripts/fng.py
+
+      # 마감 시황은 공포탐욕지수 다음에 나간다. 장중 슬롯에서는
+      # market.py 가 스스로 판단해 건너뛴다(종료코드 0).
+      # 앞 단계가 실패해도 시황은 보내도록 always() 를 쓴다.
+      - name: Send market close summary
+        if: always()
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          FNG_FORCE: ${{ github.event_name == 'workflow_dispatch' && '1' || '0' }}
+        run: python3 scripts/market.py
