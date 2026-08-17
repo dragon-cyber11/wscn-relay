@@ -1,0 +1,41 @@
+name: fng
+
+# CNN 공포·탐욕 지수를 하루 두 번 텔레그램으로 보낸다.
+# 릴레이(wscn.yml)와 분리한 이유: 릴레이는 5시간 50분짜리 장기 잡이라
+# 하루 2회 단발 작업과 수명 주기가 맞지 않는다. 여기가 죽어도 속보 중계는
+# 영향을 받지 않는다.
+
+on:
+  workflow_dispatch:
+  schedule:
+    # UTC 고정이다. 아래 KST/ET 환산은 미국 서머타임(EDT, 3~11월) 기준이고,
+    # 겨울(EST)에는 미국 시각이 1시간 밀린다. cron 문자열을 바꾸면
+    # scripts/fng.py 의 LABELS 도 같이 고쳐야 한다.
+    - cron: "0 16 * * 1-5"     # 장중  = ET 12:00 = KST 01:00 (익일)
+    - cron: "30 20 * * 1-5"    # 마감후 = ET 16:30 = KST 05:30 (익일)
+
+permissions:
+  contents: read
+
+jobs:
+  fng:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    concurrency:
+      group: fng
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Send Fear & Greed
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          # 어느 cron 이 깨웠는지 스크립트에 넘겨 라벨을 정한다.
+          # workflow_dispatch 로 돌리면 빈 값이라 "현재" 로 나간다.
+          FNG_SCHEDULE: ${{ github.event.schedule }}
+        run: python3 scripts/fng.py
