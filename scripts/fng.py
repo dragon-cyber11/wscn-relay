@@ -40,28 +40,22 @@ EMO = {"extreme fear": "😱", "fear": "😨", "neutral": "😐",
        "greed": "🤑", "extreme greed": "🔥"}
 
 
-def _parse_custom_emoji(raw):
-    """
-    "⬆️=5368324170671202286,⬇️=5368..." 형식을 {문자: id} 로.
-
-    커스텀(프리미엄) 이모지는 봇이 Fragment 에서 유저네임을 샀거나, 봇
-    소유자가 프리미엄이고 private/group/supergroup 으로 직접 보낼 때만
-    쓸 수 있다(공식 문서). 채널은 그 목록에 없으므로 될지는 실제로
-    보내봐야 안다. 그래서 실패하면 일반 이모지로 자동 재시도한다.
-
-    비워두면(기본) 지금까지와 완전히 동일하게 동작한다.
-    """
-    out = {}
-    for part in raw.split(","):
-        if "=" not in part:
-            continue
-        ch, eid = (x.strip() for x in part.split("=", 1))
-        if ch and eid.isdigit():
-            out[ch] = eid
-    return out
-
-
-CUSTOM_EMOJI = _parse_custom_emoji(os.environ.get("TG_CUSTOM_EMOJI", ""))
+# 커스텀(프리미엄) 이모지. {일반 이모지: custom_emoji_id} 로 적으면
+# 그 문자를 <tg-emoji> 로 감싸 보낸다. 비어 있으면 일반 이모지로 나간다.
+#
+# ID 는 봇 토큰으로 확인한다(팩 이름은 t.me/addemoji/<이름> 의 <이름>):
+#   curl -s "https://api.telegram.org/bot<TOKEN>/getStickerSet?name=NewsEmoji" \
+#     | python3 -m json.tool | grep -E '"emoji"|custom_emoji_id'
+#
+# 주의: 커스텀 이모지는 봇이 Fragment 에서 유저네임을 샀거나, 봇 소유자가
+# 프리미엄이고 private/group/supergroup 으로 직접 보낼 때만 쓸 수 있다
+# (공식 문서). 허용 목록에 채널이 없어 될지는 보내봐야 안다. 실패하면
+# 일반 이모지로 자동 재시도하므로 메시지를 잃지는 않는다.
+CUSTOM_EMOJI = {
+    # "⬆️": "5368324170671202286",
+    # "⬇️": "5368324170671202287",
+    # "🚨": "5368324170671202288",
+}
 
 
 def to_html(text):
