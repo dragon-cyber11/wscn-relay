@@ -1,0 +1,50 @@
+name: emoji-ids
+
+# 커스텀 이모지 팩의 custom_emoji_id 를 찍어보는 일회성 도구.
+# Actions 탭 -> emoji-ids -> Run workflow 를 누르면 로그에 번호가 나온다.
+# 그 번호를 scripts/fng.py 의 CUSTOM_EMOJI 에 적으면 된다.
+#
+# 봇 토큰은 저장소 Secret 에서 바로 읽으므로 어디에도 붙여넣을 필요가 없다.
+# (깃허브가 로그에서 Secret 값을 자동으로 가려주기도 한다)
+
+on:
+  workflow_dispatch:
+    inputs:
+      pack:
+        description: "이모지 팩 이름 (t.me/addemoji/<이름> 의 <이름>)"
+        required: false
+        default: "NewsEmoji"
+
+permissions:
+  contents: read
+
+jobs:
+  ids:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Print custom emoji ids
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          PACK: ${{ inputs.pack }}
+        run: |
+          set -u
+          curl -sS "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/getStickerSet?name=${PACK}" \
+            -o /tmp/pack.json
+          python3 - <<'PY'
+          import json
+          d = json.load(open("/tmp/pack.json"))
+          if not d.get("ok"):
+              print("실패:", d.get("description", d))
+              print("팩 이름이 맞는지 확인하세요 (t.me/addemoji/<이름>).")
+              raise SystemExit(1)
+          r = d["result"]
+          st = r.get("stickers", [])
+          print("팩: %s (%s) — %d개" % (r.get("title", "?"), r.get("name", "?"), len(st)))
+          print("-" * 52)
+          print("아래 줄들을 그대로 복사해서 붙여주면 됩니다.")
+          print("-" * 52)
+          for i, s in enumerate(st, 1):
+              print('%2d. "%s": "%s",' % (i, s.get("emoji", "?"),
+                                          s.get("custom_emoji_id", "없음")))
+          PY
