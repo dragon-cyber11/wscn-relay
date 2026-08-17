@@ -71,8 +71,9 @@ def quote(sym):
 
 
 # 등락 표시. 바꾸려면 이 줄만 고치면 된다.
-#   🔺/🔻 빨강 삼각형 · 🔴/🔵 한국식 · 🟢/🔴 미국식
-UP, DOWN, FLAT = "⬆️", "⬇️", "➡️"
+# 커스텀(프리미엄) 이모지를 쓰려면 여기 글자를 fng.py 의 CUSTOM_EMOJI
+# 키와 똑같이 맞춰야 <tg-emoji> 로 치환된다. 지금은 팩에 있는 🔼🔽➡️.
+UP, DOWN, FLAT = "🔼", "🔽", "➡️"
 
 
 def treasury():
@@ -114,7 +115,7 @@ def line(name, v, pc, nd):
     # 화살표로 방향이 보이지만 부호도 같이 적는다. 숫자만 눈으로 훑을 때
     # 부호가 없으면 상승·하락이 구분되지 않는다.
     # 표시할 자리수로 먼저 반올림해야 화살표와 숫자가 어긋나지 않는다
-    # (예: +0.004% 를 그대로 두면 ⬆️0.00% 가 된다).
+    # (예: +0.004% 를 그대로 두면 🔼0.00% 가 된다).
     d = round((v - pc) / pc * 100.0, 2) if pc else 0.0
     mark = UP if d > 0 else DOWN if d < 0 else FLAT
     return "%s %s  %s%s" % (name, num(v, nd), mark, signed(d, 2, "%"))
