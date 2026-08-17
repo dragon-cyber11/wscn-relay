@@ -199,7 +199,6 @@ def render():
     tail = "기준 %s KST" % datetime.now(KST).strftime("%H:%M")
     if miss:
         tail += " · %d개 항목 조회 실패" % miss
-    tail += "  #속보"
     # 기준 시각 줄은 바로 위 블록에 붙인다(그룹 사이 빈 줄과 달리
     # 마지막 빈 줄만 걷어낸다).
     while out and out[-1] == "":

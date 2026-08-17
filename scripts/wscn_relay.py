@@ -129,6 +129,20 @@ def noise_reason(t):
 BREAKING_LABELS = ["突发", "快讯", "重磅", "独家", "紧急", "刚刚", "爆"]
 LABEL_RE = re.compile(r"^\s*[【\[]\s*([^】\]]{1,12})\s*[】\]]")
 
+# #속보 판정: 미국 물가·고용 핵심 지표 발표. WSCN 원문(중국어) 제목이
+# '美国' 과 아래 지표어를 함께 담으면 지표 발표로 보고 시간 옆에 #속보 를 붙인다.
+# 미국으로 한정하려 '美国' 을 함께 요구한다 — CPI·PPI·PCE 는 중국·유로존·
+# 일본에도 있어 지표어만으로는 나라를 가를 수 없기 때문이다.
+#   失业金  = 初请/续请/申请失业金(신규·연속 실업수당) 전부 포함
+#   非农    = 비농업 고용,  失业率 = 실업률,  ADP = ADP 민간고용
+KEY_INDICATOR = re.compile(r"CPI|PPI|PCE|非农|失业率|失业金|ADP")
+
+
+def is_indicator(head):
+    """미국 물가·고용 핵심 지표 발표면 True."""
+    h = head or ""
+    return "美国" in h and bool(KEY_INDICATOR.search(h))
+
 
 def log(m):
     print("[%s] %s" % (datetime.now(KST).strftime("%H:%M:%S"), m), flush=True)
@@ -603,12 +617,16 @@ def main():
                 ko = translate(head)
                 hhmm = to_kst(it.get("display_time"))
                 mark = "🚨 " if is_breaking(head, it) else ""
+                # 미국 물가·고용 지표 발표는 시간 옆에 #속보 를 붙인다.
+                tag = " #속보" if is_indicator(head) else ""
 
                 lines = ["%s%s" % (mark, ko)]
                 if ko.strip() != head.strip():
                     lines.append("(원문: %s)" % head)
                 if hhmm:
-                    lines.append("(%s)" % hhmm)
+                    lines.append("(%s)%s" % (hhmm, tag))
+                elif tag:
+                    lines.append(tag.strip())
                 msg = "\n".join(lines)
                 if len(msg) > 4000:
                     msg = msg[:3990] + "…"
