@@ -85,9 +85,17 @@ def fetch():
     raise RuntimeError("CNN 조회 실패 (%d회 시도, %s)" % (att, last))
 
 
-def bar(v, n=22):
-    p = max(0, min(n - 1, int(v / 100.0 * n)))
-    return "".join("●" if i == p else "─" for i in range(n))
+BAR_N = 20
+
+
+def bar(v, n=BAR_N):
+    """
+    공백으로 위치를 맞추지 않는다. 텔레그램 기본 글꼴은 가변폭이고
+    글자 크기도 사용자마다 달라서, 공백 정렬은 보는 사람에 따라 깨진다.
+    같은 폭이 보장되는 블록 문자만 이어 붙여 채움 비율로 위치를 나타낸다.
+    """
+    p = max(1, min(n, int(round(v / 100.0 * n))))
+    return "▓" * p + "░" * (n - p)
 
 
 def render(j, label="현재"):
@@ -98,14 +106,18 @@ def render(j, label="현재"):
     age = (datetime.now(KST) - ts).total_seconds() / 3600.0
 
     def cmp(name, v):
-        return "  %-6s %4.0f  (%+.1f)" % (name, float(v), s - float(v))
+        d = s - float(v)
+        mark = "▲%.1f" % d if d > 0 else "▼%.1f" % abs(d) if d < 0 else "―"
+        # 열 맞춤을 하지 않는다. 한 줄에 한 항목이라 정렬이 필요 없다.
+        return "%s %.0f  %s" % (name, float(v), mark)
 
     return "\n".join([
         "%s CNN 공포·탐욕 지수 — %s" % (EMO.get(rating, "📊"), label),
         "",
-        "   %.0f  ·  %s" % (s, KO.get(rating, rating)),
-        "   공포 %s 탐욕" % bar(s),
-        "        0    25   45 55   75   100",
+        "%.0f · %s" % (s, KO.get(rating, rating)),
+        # 라벨을 막대와 같은 줄에 둔다. 별도 눈금 줄을 쓰면 가변폭에서
+        # 숫자와 막대가 어긋난다.
+        "공포 %s 탐욕" % bar(s),
         "",
         cmp("전일", fg["previous_close"]),
         cmp("1주 전", fg["previous_1_week"]),
@@ -114,7 +126,7 @@ def render(j, label="현재"):
         "",
         # CNN 은 미국 장중에만 갱신한다. 휴장이면 값이 그대로이므로
         # 기준 시각을 항상 붙여서 신선도를 눈으로 확인할 수 있게 한다.
-        "기준: %s KST (%.0f시간 전)" % (ts.strftime("%m-%d %H:%M"), age),
+        "기준 %s KST (%.0f시간 전)" % (ts.strftime("%m-%d %H:%M"), age),
         "cnn.com/markets/fear-and-greed",
     ])
 
