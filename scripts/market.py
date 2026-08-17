@@ -61,21 +61,25 @@ def quote(sym):
     return None
 
 
+# 등락 표시. 다른 조합으로 바꾸려면 이 세 줄만 고치면 된다.
+#   🔴/🔵 한국식(상승 빨강·하락 파랑) · 🟢/🔴 미국식 · ⬆️/⬇️ 화살표
+UP, DOWN, FLAT = "🔺", "🔻", "▪️"
+
+
 def num(v, nd):
     return format(round(v, nd), ",.%df" % nd)
 
 
 def line(name, v, pc, nd):
-    """등락률을 앞에 둔다. 부호+숫자 폭이 비슷해 세로로 읽기 쉽다."""
     d = (v - pc) / pc * 100.0 if pc else 0.0
-    mark = "▲" if d > 0 else "▼" if d < 0 else "―"
-    return "%s%.2f%%  %s %s" % (mark, abs(d), name, num(v, nd))
+    mark = UP if d > 0 else DOWN if d < 0 else FLAT
+    return "%s %s  %s%.2f%%" % (name, num(v, nd), mark, abs(d))
 
 
 def yline(name, v, pc, nd):
     bp = (v - pc) * 100.0
-    mark = "▲" if bp > 0 else "▼" if bp < 0 else "―"
-    return "%s%.1fbp  %s %s%%" % (mark, abs(bp), name, num(v, nd))
+    mark = UP if bp > 0 else DOWN if bp < 0 else FLAT
+    return "%s %s%%  %s%.1fbp" % (name, num(v, nd), mark, abs(bp))
 
 
 def render():
