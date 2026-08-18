@@ -1,22 +1,34 @@
 name: fng
 
-# CNN 공포·탐욕 지수를 하루 두 번 텔레그램으로 보낸다.
+# CNN 공포·탐욕 지수 + 지역별 마감 시황을 텔레그램으로 보낸다.
 # 릴레이(wscn.yml)와 분리한 이유: 릴레이는 5시간 50분짜리 장기 잡이라
-# 하루 2회 단발 작업과 수명 주기가 맞지 않는다. 여기가 죽어도 속보 중계는
-# 영향을 받지 않는다.
+# 단발 작업과 수명 주기가 맞지 않는다. 여기가 죽어도 속보 중계는 무관하다.
+#
+# 한 워크플로에서 fng.py -> market.py 순으로 돈다.
+#   - 공포탐욕지수(fng.py): 미국 장중/마감 두 슬롯에서만 보낸다.
+#   - 마감 시황(market.py): 아시아·유럽·미국 각 장 마감 뒤 해당 지역만 보낸다.
+# 각 스크립트가 현지시각을 보고 자기 슬롯이 아니면 스스로 건너뛰므로(종료코드
+# 0), 아래 cron 은 그냥 후보 시각을 다 깨우기만 하면 된다.
 
 on:
   workflow_dispatch:
+    inputs:
+      region:
+        description: "마감 시황 강제 발송 지역: asia | europe | us (비우면 미국)"
+        required: false
+        default: ""
   schedule:
-    # GitHub Actions cron 은 UTC 고정이라 서머타임을 못 따라간다.
-    # 그래서 서머타임(EDT)/표준시(EST) 후보 시각 양쪽에 cron 을 걸어두고,
-    # 실제로 보낼지는 scripts/fng.py 가 뉴욕 현지시각을 보고 정한다.
-    # 계절마다 어느 한쪽만 발송되고 나머지는 조용히 건너뛴다.
-    # 시각을 바꾸려면 fng.py 의 PHASES 와 아래 네 줄을 같이 고친다.
-    - cron: "0 17 * * 1-5"     # 장중 13:00 ET (EDT) — KST 02:00
-    - cron: "0 18 * * 1-5"     # 장중 13:00 ET (EST) — KST 03:00
-    - cron: "30 21 * * 1-5"    # 마감 17:30 ET (EDT) — KST 06:30
-    - cron: "30 22 * * 1-5"    # 마감 17:30 ET (EST) — KST 07:30
+    # GitHub Actions cron 은 UTC 고정이라 서머타임을 못 따라간다. 그래서
+    # 서머타임/표준시 후보를 양쪽에 걸고, 실제 발송은 각 스크립트가 현지시각
+    # 으로 정한다. 시각을 바꾸려면 fng.py PHASES / market.py REGIONS 와
+    # 아래 줄을 같이 고친다.
+    - cron: "0 17 * * 1-5"     # 美 장중 13:00 ET (EDT) — F&G
+    - cron: "0 18 * * 1-5"     # 美 장중 13:00 ET (EST) — F&G
+    - cron: "15 8 * * 1-5"     # 아시아 마감 17:15 KST (DST 없음) — 시황
+    - cron: "45 15 * * 1-5"    # 유럽 마감 17:45 (CEST) — KST 00:45 — 시황
+    - cron: "45 16 * * 1-5"    # 유럽 마감 17:45 (CET)  — KST 01:45 — 시황
+    - cron: "30 21 * * 1-5"    # 美 마감 17:30 ET (EDT) — KST 06:30 — F&G + 시황
+    - cron: "30 22 * * 1-5"    # 美 마감 17:30 ET (EST) — KST 07:30 — F&G + 시황
 
 permissions:
   contents: read
@@ -24,7 +36,7 @@ permissions:
 jobs:
   fng:
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 8
     concurrency:
       group: fng
       cancel-in-progress: false
@@ -45,13 +57,15 @@ jobs:
           FNG_FORCE: ${{ github.event_name == 'workflow_dispatch' && '1' || '0' }}
         run: python3 scripts/fng.py
 
-      # 마감 시황은 공포탐욕지수 다음에 나간다. 장중 슬롯에서는
-      # market.py 가 스스로 판단해 건너뛴다(종료코드 0).
-      # 앞 단계가 실패해도 시황은 보내도록 always() 를 쓴다.
+      # 마감 시황. 미국 슬롯에서는 F&G 다음에 미국 시황이 나가고, 아시아·유럽
+      # 슬롯에서는 F&G 가 건너뛴 뒤 해당 지역 시황만 나간다. 자기 슬롯이 아니면
+      # market.py 가 스스로 건너뛴다(종료코드 0). 앞 단계가 실패해도 보내도록
+      # always() 를 쓴다. 수동 실행 지역은 region 입력으로 지정(비우면 미국).
       - name: Send market close summary
         if: always()
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          MARKET_REGION: ${{ github.event.inputs.region }}
           FNG_FORCE: ${{ github.event_name == 'workflow_dispatch' && '1' || '0' }}
         run: python3 scripts/market.py

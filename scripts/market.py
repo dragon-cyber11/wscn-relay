@@ -1,32 +1,40 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""글로벌 마감 시황 -> 텔레그램. 미국·아시아 지수, 원자재·금리·환율 한 장.
+"""지역별 마감 시황 -> 텔레그램. 아시아·유럽·미국을 각 장 마감 뒤 따로 보낸다.
 
-발송 시점 판정(서머타임 포함)과 텔레그램 전송은 fng.py 것을 그대로 쓴다.
-같은 워크플로에서 fng.py 다음에 실행되며, 마감 슬롯에서만 보낸다.
+각 지역 장이 다 끝난 시각에 그 지역 주요 지수를 정리한다. 원자재·환율·금리는
+미국 마감 메시지에만 붙인다. 발송 시각 판정(서머타임 포함)은 아래 REGIONS 와
+region_phase() 가, 텔레그램 전송은 fng.py 것을 그대로 쓴다.
 """
 
-import csv, io, json, sys, time
+import csv, io, json, os, sys, time
 import urllib.error, urllib.parse, urllib.request
-from datetime import datetime
+from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
 
-from fng import FORCE, KST, TRIES, BACKOFF, UA, log, phase, tg_send
+from fng import FORCE, KST, TRIES, BACKOFF, UA, log, tg_send
 
 CHART = "https://query1.finance.yahoo.com/v8/finance/chart/%s?interval=1d&range=5d"
 
-# (야후 티커, 표시명, 소수 자릿수)
-GROUPS = [
-    ("미국", [
-        ("^GSPC", "S&P500", 2), ("^IXIC", "나스닥", 2), ("^DJI", "다우", 2),
-        ("^RUT", "러셀2000", 2), ("^VIX", "VIX", 2),
-    ]),
-    # 미국장 마감(KST 06:30/07:30) 시점엔 아시아 당일장은 아직 안 열렸다.
-    # 그래서 여기 값은 직전 아시아 세션 종가이고, 위 미국 지수와 같은
-    # 거래일(직전) 마감을 함께 보여주게 된다.
-    ("아시아", [
+# 지역별 주요 지수 (야후 티커, 표시명, 소수 자릿수)
+IDX = {
+    "asia": [
         ("000001.SS", "상하이", 2), ("^TWII", "대만가권", 2),
         ("^N225", "닛케이", 2), ("^KS11", "코스피", 2), ("^HSI", "항셍", 2),
-    ]),
+    ],
+    "europe": [
+        ("^GDAXI", "독일DAX", 2), ("^STOXX50E", "유로스톡스50", 2),
+        ("^FTSE", "영국FTSE", 2), ("^FCHI", "프랑스CAC", 2),
+        ("^IBEX", "스페인IBEX", 2),
+    ],
+    "us": [
+        ("^GSPC", "S&P500", 2), ("^IXIC", "나스닥", 2), ("^DJI", "다우", 2),
+        ("^RUT", "러셀2000", 2), ("^VIX", "VIX", 2),
+    ],
+}
+
+# 원자재·환율은 미국 마감 메시지에만 붙는다(금리는 재무부 CSV 로 따로 처리).
+US_EXTRA = [
     ("원자재", [
         ("CL=F", "WTI", 2), ("BZ=F", "브렌트", 2), ("GC=F", "금", 2),
         ("SI=F", "은", 2), ("HG=F", "구리", 3), ("NG=F", "천연가스", 3),
@@ -37,11 +45,26 @@ GROUPS = [
     ]),
 ]
 
+# 지역별 발송 시점: 키 -> (표준시간대, 시, 분, 표시명). 각 지역 '장이 다 끝난
+# 뒤'를 노린다. GitHub cron 은 UTC 고정이라 서머타임을 못 따라가므로,
+# 워크플로엔 계절별 후보 cron 을 걸어두고 실제 발송 여부는 region_phase()
+# 가 현지시각으로 판정한다.
+#   아시아: 홍콩 16:00(HKT) 마감 뒤 = 서울 17:15. 한·일·중·대·홍 DST 없음(후보 1개).
+#   유럽:   프랑크푸르트/파리 17:30(CET/CEST) 마감 뒤 17:45 현지.
+#   미국:   16:00(ET) 마감 뒤, 종가 반영이 끝난 17:30 현지.
+REGIONS = {
+    "asia":   ("Asia/Seoul",       17, 15, "아시아"),
+    "europe": ("Europe/Berlin",    17, 45, "유럽"),
+    "us":     ("America/New_York",  17, 30, "미국"),
+}
+# cron 지연을 흡수하는 창. 각 지역 발송창이 서로 겹치지 않을 만큼만.
+WINDOW_MIN = 55
+
 # 국채 수익률은 미 재무부 공식 일일 곡선을 쓴다.
 # 야후에는 2년물 현물 지수가 없고, 대체 후보인 2YY=F 는 유동성이 없어
 # 며칠씩 같은 값에 머무른다(실측 08-07~08-13 내내 4.170 고정).
 # 재무부 CSV 는 2/10/30년을 모두 담고 미국 동부시간 오후에 갱신되므로
-# 마감 발송 시각(ET 17:30)과도 맞는다.
+# 미국 마감 발송 시각(ET 17:30)과도 맞는다.
 TREASURY = ("https://home.treasury.gov/resource-center/data-chart-center/"
             "interest-rates/daily-treasury-rates.csv/%d/all"
             "?type=daily_treasury_yield_curve&field_tdr_date_value=%d"
@@ -49,14 +72,31 @@ TREASURY = ("https://home.treasury.gov/resource-center/data-chart-center/"
 YIELD_COLS = [("2 Yr", "미2년물"), ("10 Yr", "미10년물"), ("30 Yr", "미30년물")]
 
 
+def region_phase(now=None):
+    """
+    지금이 어느 지역 마감 발송창인지 현지시각으로 판정한다.
+    해당 없으면 (None, ...) — 반대 계절용 cron 이 깨운 경우다.
+
+    각 지역의 목표 시각 이후 WINDOW_MIN 분까지만 받아들이므로 cron 이 조금
+    늦게 떠도 발송되고, 1시간 어긋난 반대 계절 cron 은 창 밖이라 조용히 넘어간다.
+    """
+    utc = now or datetime.now(timezone.utc)
+    for key, (zone, h, m, _label) in REGIONS.items():
+        loc = utc.astimezone(ZoneInfo(zone))
+        target = loc.replace(hour=h, minute=m, second=0, microsecond=0)
+        delta = (loc - target).total_seconds() / 60.0
+        if 0 <= delta < WINDOW_MIN:
+            return key, loc
+    return None, utc.astimezone(KST)
+
+
 def prev_close(p, closes):
     """
     일간 등락용 '직전 세션 종가'를 일봉 종가 배열에서 고른다.
 
     meta.chartPreviousClose 는 range(5d) 시작 이전 종가(≈5~6일 전)라
-    하루 등락 계산에는 못 쓴다. 예전엔 그걸 써서 등락률이 며칠치로
-    부풀려져 있었다. 배열의 마지막이 현재가와 가장 가까우면 그게 현재
-    세션 종가이므로 직전은 [-2], 장중이라 마지막이 어제 종가면 그게 곧
+    하루 등락 계산에는 못 쓴다. 배열의 마지막이 현재가와 가장 가까우면 그게
+    현재 세션 종가이므로 직전은 [-2], 장중이라 마지막이 어제 종가면 그게 곧
     직전 종가이므로 [-1] 을 쓴다.
     """
     if len(closes) < 2:
@@ -159,64 +199,87 @@ def yline(name, v, pc):
     return "%s %.2f%%  %s%s" % (name, v, mark, signed(bp, 1, "bp"))
 
 
-def render():
+def _fill(rows):
+    """티커 목록을 조회해 (표시줄들, 성공수, 실패수) 로 돌려준다."""
+    body, got, miss = [], 0, 0
+    for sym, name, nd in rows:
+        q = quote(sym)
+        if q is None:
+            miss += 1
+            continue
+        body.append(line(name, q[0], q[1], nd))
+        got += 1
+        time.sleep(0.2)
+    return body, got, miss
+
+
+def render(region):
+    """지역 마감 메시지. 아시아·유럽은 지수만, 미국은 원자재·환율·금리까지."""
+    label = REGIONS[region][3]
     out, got, miss = [], 0, 0
-    for title, rows in GROUPS:
+
+    if region == "us":
+        # 미국: 지수 + 원자재·환율 + 금리. 구획이 여럿이라 소제목을 붙인다.
+        for title, rows in [("지수", IDX["us"])] + US_EXTRA:
+            body, g, m = _fill(rows)
+            got += g
+            miss += m
+            if body:
+                out += ["[%s]" % title] + body + [""]
+        tr = treasury()
         body = []
-        for sym, name, nd in rows:
-            q = quote(sym)
-            if q is None:
-                miss += 1
-                continue
-            body.append(line(name, q[0], q[1], nd))
-            got += 1
-            time.sleep(0.2)
+        if len(tr) >= 2:
+            for col, name in YIELD_COLS:
+                try:
+                    v, pc = float(tr[0][col]), float(tr[1][col])
+                except (KeyError, TypeError, ValueError):
+                    miss += 1
+                    continue
+                body.append(yline(name, v, pc))
+                got += 1
+        else:
+            miss += len(YIELD_COLS)
         if body:
-            out.append("[%s]" % title)
-            out += body
-            out.append("")
-    tr = treasury()
-    body = []
-    if len(tr) >= 2:
-        for col, name in YIELD_COLS:
-            try:
-                v, pc = float(tr[0][col]), float(tr[1][col])
-            except (KeyError, TypeError, ValueError):
-                miss += 1
-                continue
-            body.append(yline(name, v, pc))
-            got += 1
+            out += ["[금리]"] + body + [""]
     else:
-        miss += len(YIELD_COLS)
-    if body:
-        out.append("[금리]")
-        out += body
-        out.append("")
+        # 아시아·유럽: 지수 한 덩어리라 소제목 없이 나열한다.
+        body, got, miss = _fill(IDX[region])
+        out += body + [""]
 
     if not got:
         return None, got, miss
-    head = "📊 글로벌 마감 시황 — %s" % datetime.now(KST).strftime("%m-%d")
+    head = "📊 %s 마감 시황 — %s" % (label, datetime.now(KST).strftime("%m-%d"))
     tail = "기준 %s KST" % datetime.now(KST).strftime("%H:%M")
     if miss:
         tail += " · %d개 항목 조회 실패" % miss
-    # 기준 시각 줄은 바로 위 블록에 붙인다(그룹 사이 빈 줄과 달리
-    # 마지막 빈 줄만 걷어낸다).
+    # 기준 시각 줄은 바로 위 블록에 붙인다(마지막 빈 줄만 걷어낸다).
     while out and out[-1] == "":
         out.pop()
     return "\n".join([head, ""] + out + [tail]), got, miss
 
 
 def main():
-    label, et = phase()
-    # 마감 슬롯에서만 보낸다. 장중에는 CNN 지수만 나간다.
-    if label != "미국장 마감" and not FORCE:
-        log("마감 시점 아님 (뉴욕 %s) -> 건너뜀" % et.strftime("%m-%d %H:%M %Z"))
-        return 0
-    msg, got, miss = render()
+    # 지역은 (1) 수동 지정 MARKET_REGION, (2) 현재 시각 판정 순으로 정한다.
+    region = os.environ.get("MARKET_REGION", "").strip().lower()
+    if region and region not in REGIONS:
+        log("알 수 없는 MARKET_REGION=%r -> 무시" % region)
+        region = ""
+    if not region:
+        region, loc = region_phase()
+        if region is None:
+            if not FORCE:
+                # 반대 계절용 cron 이 깨운 것이다. 실패가 아니므로 0.
+                log("마감 발송창 아님 (%s) -> 건너뜀"
+                    % loc.strftime("%m-%d %H:%M %Z"))
+                return 0
+            region = "us"   # 수동 강제인데 지정이 없으면 미국으로 본다
+            log("강제 발송: 지역 지정 없음 -> 미국 마감")
+
+    msg, got, miss = render(region)
     if msg is None:
-        log("FATAL: 전 종목 조회 실패")
+        log("FATAL: %s 마감 전 종목 조회 실패" % REGIONS[region][3])
         return 1
-    log("발송: 시황 %d종목 (실패 %d)" % (got, miss))
+    log("발송: %s 마감 %d종목 (실패 %d)" % (REGIONS[region][3], got, miss))
     return 0 if tg_send(msg) else 1
 
 
