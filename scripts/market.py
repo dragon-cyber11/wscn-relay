@@ -107,7 +107,10 @@ def prev_close(p, closes):
 
 
 def quote(sym):
-    """현재가와 직전 세션 종가. 실패하면 None (그 항목만 빠진다)."""
+    """(현재가, 직전 세션 종가, 마지막 체결 epoch). 실패하면 None.
+
+    세 번째 값은 휴장 판정에 쓴다(오늘 거래가 있었는지). 없으면 None.
+    """
     url = CHART % urllib.parse.quote(sym)
     last = "unknown"
     for att in range(1, TRIES + 1):
@@ -118,6 +121,7 @@ def quote(sym):
             res = d["chart"]["result"][0]
             m = res["meta"]
             p = m.get("regularMarketPrice")
+            ts = m.get("regularMarketTime")
             closes = [c for c in
                       ((res.get("indicators", {}).get("quote") or [{}])[0]
                        .get("close") or [])
@@ -128,7 +132,7 @@ def quote(sym):
             if p is None or not pc:
                 last = "필드 없음"
             else:
-                return float(p), float(pc)
+                return float(p), float(pc), ts
         except urllib.error.HTTPError as e:
             last = "HTTP %d" % e.code
             if 400 <= e.code < 500 and e.code != 429:
@@ -199,6 +203,14 @@ def yline(name, v, pc):
     return "%s %.2f%%  %s%s" % (name, v, mark, signed(bp, 1, "bp"))
 
 
+def _today_in(ts, zone):
+    """야후 마지막 체결 epoch 이 zone 기준 오늘이면 True(휴장 판정용)."""
+    if not ts:
+        return False
+    z = ZoneInfo(zone)
+    return datetime.fromtimestamp(ts, z).date() == datetime.now(z).date()
+
+
 def _fill(rows):
     """티커 목록을 조회해 (표시줄들, 성공수, 실패수) 로 돌려준다."""
     body, got, miss = [], 0, 0
@@ -213,14 +225,45 @@ def _fill(rows):
     return body, got, miss
 
 
-def render(region):
-    """지역 마감 메시지. 아시아·유럽은 지수만, 미국은 원자재·환율·금리까지."""
-    label = REGIONS[region][3]
-    out, got, miss = [], 0, 0
+def _fill_idx(rows, zone):
+    """지수 채우기. (표시줄, 성공, 실패, 오늘거래수) — 마지막은 휴장 판정용."""
+    body, got, miss, traded = [], 0, 0, 0
+    for sym, name, nd in rows:
+        q = quote(sym)
+        if q is None:
+            miss += 1
+            continue
+        p, pc, ts = q
+        body.append(line(name, p, pc, nd))
+        got += 1
+        if _today_in(ts, zone):
+            traded += 1
+        time.sleep(0.2)
+    return body, got, miss, traded
 
+
+def render(region):
+    """
+    지역 마감 메시지를 (msg, 성공, 실패, 사유) 로 돌려준다.
+    아시아·유럽은 지수만, 미국은 원자재·환율·금리까지.
+    사유: ok / empty(전부 조회 실패) / holiday(오늘 거래 없음).
+    """
+    zone, _h, _m, label = REGIONS[region]
+
+    # 지수를 먼저 채우면서 '오늘 거래된' 종목 수를 센다.
+    idx_body, got, miss, traded = _fill_idx(IDX[region], zone)
+    if not idx_body:
+        return None, got, miss, "empty"
+    # 지수를 다 불렀는데 이 지역에서 오늘 아무도 거래 안 했으면 휴장이다.
+    # 메시지는 그대로 만들되 사유로 표시만 한다 — 정규 발송은 main 에서
+    # 건너뛰고, 수동 강제 발송은 (전날 종가라도) 보낸다.
+    reason = "holiday" if traded == 0 else "ok"
+
+    out = []
     if region == "us":
         # 미국: 지수 + 원자재·환율 + 금리. 구획이 여럿이라 소제목을 붙인다.
-        for title, rows in [("지수", IDX["us"])] + US_EXTRA:
+        out += ["[지수]"] + idx_body + [""]
+        for title, rows in US_EXTRA:
             body, g, m = _fill(rows)
             got += g
             miss += m
@@ -243,11 +286,8 @@ def render(region):
             out += ["[금리]"] + body + [""]
     else:
         # 아시아·유럽: 지수 한 덩어리라 소제목 없이 나열한다.
-        body, got, miss = _fill(IDX[region])
-        out += body + [""]
+        out += idx_body + [""]
 
-    if not got:
-        return None, got, miss
     head = "📊 %s 마감 시황 — %s" % (label, datetime.now(KST).strftime("%m-%d"))
     tail = "기준 %s KST" % datetime.now(KST).strftime("%H:%M")
     if miss:
@@ -255,7 +295,7 @@ def render(region):
     # 기준 시각 줄은 바로 위 블록에 붙인다(마지막 빈 줄만 걷어낸다).
     while out and out[-1] == "":
         out.pop()
-    return "\n".join([head, ""] + out + [tail]), got, miss
+    return "\n".join([head, ""] + out + [tail]), got, miss, reason
 
 
 def main():
@@ -275,11 +315,17 @@ def main():
             region = "us"   # 수동 강제인데 지정이 없으면 미국으로 본다
             log("강제 발송: 지역 지정 없음 -> 미국 마감")
 
-    msg, got, miss = render(region)
+    label = REGIONS[region][3]
+    msg, got, miss, reason = render(region)
     if msg is None:
-        log("FATAL: %s 마감 전 종목 조회 실패" % REGIONS[region][3])
+        log("FATAL: %s 마감 전 종목 조회 실패" % label)
         return 1
-    log("발송: %s 마감 %d종목 (실패 %d)" % (REGIONS[region][3], got, miss))
+    if reason == "holiday" and not FORCE:
+        # 휴장일: 조용히 넘긴다(실패가 아니므로 0). 강제 발송은 그대로 보낸다.
+        log("%s 휴장(오늘 거래 없음) -> 건너뜀" % label)
+        return 0
+    log("발송: %s 마감 %d종목 (실패 %d)%s"
+        % (label, got, miss, " [휴장·강제]" if reason == "holiday" else ""))
     return 0 if tg_send(msg) else 1
 
 

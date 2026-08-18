@@ -125,11 +125,6 @@ def noise_reason(t):
     return False, ""
 
 
-# 🚨 판정: 제목 맨 앞의 【라벨】 이 속보성이면 사이렌
-BREAKING_LABELS = ["突发", "快讯", "重磅", "独家", "紧急", "刚刚", "爆"]
-LABEL_RE = re.compile(r"^\s*[【\[]\s*([^】\]]{1,12})\s*[】\]]")
-
-
 def log(m):
     print("[%s] %s" % (datetime.now(KST).strftime("%H:%M:%S"), m), flush=True)
 
@@ -372,20 +367,6 @@ def headline(it):
     return t[:TITLE_MAX]
 
 
-def label_of(head):
-    m = LABEL_RE.match(head or "")
-    return m.group(1) if m else None
-
-
-def is_breaking(head, it):
-    lab = label_of(head)
-    if lab and any(k in lab for k in BREAKING_LABELS):
-        return True
-    if (it.get("highlight_title") or "").strip():
-        return True
-    return False
-
-
 def fetch(limit=20, cursor=None):
     p = ("/apiv1/content/lives?channel=%s&accept=live&limit=%d"
          % (CHANNEL, limit))
@@ -521,7 +502,6 @@ def main():
     feed_reason = "ok"      # 피드(fetch) 상태
     send_reason = "-"       # 마지막 전송 결과 (절대 feed_reason과 섞지 않는다)
     lag = -1
-    labels = {}
     blocked = 0
     limited = 0
     fails = {}      # id -> 메시지 자체 문제로 거부된 횟수
@@ -596,15 +576,10 @@ def main():
                     write_text(F_LAST_ID, str(last_id))
                     continue
 
-                lab = label_of(head)
-                if lab:
-                    labels[lab] = labels.get(lab, 0) + 1
-
                 ko = translate(head)
                 hhmm = to_kst(it.get("display_time"))
-                mark = "🚨 " if is_breaking(head, it) else ""
 
-                lines = ["%s%s" % (mark, ko)]
+                lines = [ko]
                 if ko.strip() != head.strip():
                     lines.append("(원문: %s)" % head)
                 if hhmm:
@@ -672,7 +647,7 @@ def main():
                       send_reason=send_reason, lag=lag, rejects=_reject_count,
                       dropped=dropped, unconfirmed=unconfirmed,
                       tr_fail=_tr_fail,
-                      filtered=_counts(filt), labels=_counts(labels, "-"))
+                      filtered=_counts(filt))
             commit_state()
             tc = time.time()
 
@@ -691,7 +666,7 @@ def main():
               send_reason=send_reason, lag=lag, rejects=_reject_count,
               dropped=dropped, unconfirmed=unconfirmed,
               tr_fail=_tr_fail,
-              filtered=_counts(filt), labels=_counts(labels, "-"),
+              filtered=_counts(filt),
               exit="normal")
     commit_state()
     log("done sent=%d last_id=%d unconfirmed=%d" % (total, last_id, unconfirmed))
