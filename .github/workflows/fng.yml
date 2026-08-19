@@ -67,5 +67,7 @@ jobs:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           MARKET_REGION: ${{ github.event.inputs.region }}
+          # 어느 cron 이 깨웠는지. 스케줄이 지연돼도 지역 판정이 안 흔들린다.
+          MARKET_SCHEDULE: ${{ github.event.schedule }}
           FNG_FORCE: ${{ github.event_name == 'workflow_dispatch' && '1' || '0' }}
         run: python3 scripts/market.py

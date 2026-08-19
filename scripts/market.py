@@ -90,6 +90,33 @@ def region_phase(now=None):
     return None, utc.astimezone(KST)
 
 
+# 어느 cron 이 이 실행을 깨웠는지(github.event.schedule)로 지역을 정한다.
+# GitHub 스케줄은 부하 때 수십 분~몇 시간씩 지연되는데, 벽시계로 판정하면
+# 늦게 뜬 크론이 발송창을 지나쳐 통째로 누락된다(실측: 아시아 크론이 1시간
+# 40분 밀려 건너뜀). cron 식별자로 지역을 정하면 아무리 늦어도 안 바뀐다.
+# 서머타임 후보가 둘인 지역은 지금 표준시 오프셋으로 맞는 쪽만 보낸다
+# (크론은 계절과 무관하게 매일 다 뜨므로, 안 그러면 하루 두 번 나간다).
+SCHED = {
+    "15 8 * * 1-5":  ("asia",   None),   # DST 없음
+    "45 15 * * 1-5": ("europe",  2),     # CEST (UTC+2)
+    "45 16 * * 1-5": ("europe",  1),     # CET  (UTC+1)
+    "30 21 * * 1-5": ("us",     -4),     # EDT  (UTC-4)
+    "30 22 * * 1-5": ("us",     -5),     # EST  (UTC-5)
+}
+
+
+def region_from_schedule(cron):
+    """github.event.schedule -> 지역. 계절이 안 맞는 후보 cron 이면 None."""
+    hit = SCHED.get((cron or "").strip())
+    if not hit:
+        return None            # 시황과 무관한 크론(예: F&G 장중) -> 건너뜀
+    region, want_off = hit
+    if want_off is None:
+        return region
+    off = datetime.now(ZoneInfo(REGIONS[region][0])).utcoffset().total_seconds()
+    return region if round(off / 3600.0) == want_off else None
+
+
 def prev_close(p, closes):
     """
     일간 등락용 '직전 세션 종가'를 일봉 종가 배열에서 고른다.
@@ -299,21 +326,30 @@ def render(region):
 
 
 def main():
-    # 지역은 (1) 수동 지정 MARKET_REGION, (2) 현재 시각 판정 순으로 정한다.
+    # 지역 판정 우선순위:
+    #   1) 수동 지정 MARKET_REGION (workflow_dispatch 입력)
+    #   2) 어느 cron 이 깨웠는지 MARKET_SCHEDULE (스케줄 실행) — 지연에 강함
+    #   3) 현재 시각 region_phase (스케줄 정보 없을 때의 보루)
     region = os.environ.get("MARKET_REGION", "").strip().lower()
     if region and region not in REGIONS:
         log("알 수 없는 MARKET_REGION=%r -> 무시" % region)
         region = ""
     if not region:
-        region, loc = region_phase()
-        if region is None:
-            if not FORCE:
-                # 반대 계절용 cron 이 깨운 것이다. 실패가 아니므로 0.
-                log("마감 발송창 아님 (%s) -> 건너뜀"
-                    % loc.strftime("%m-%d %H:%M %Z"))
+        cron = os.environ.get("MARKET_SCHEDULE", "").strip()
+        if cron:
+            region = region_from_schedule(cron)
+            if region is None:
+                log("이 지역/계절 발송 아님 (cron=%s) -> 건너뜀" % cron)
                 return 0
-            region = "us"   # 수동 강제인데 지정이 없으면 미국으로 본다
-            log("강제 발송: 지역 지정 없음 -> 미국 마감")
+        else:
+            region, loc = region_phase()
+            if region is None:
+                if not FORCE:
+                    log("마감 발송창 아님 (%s) -> 건너뜀"
+                        % loc.strftime("%m-%d %H:%M %Z"))
+                    return 0
+                region = "us"   # 수동 강제인데 지정이 없으면 미국으로 본다
+                log("강제 발송: 지역 지정 없음 -> 미국 마감")
 
     label = REGIONS[region][3]
     msg, got, miss, reason = render(region)
