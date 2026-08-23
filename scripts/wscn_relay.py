@@ -204,13 +204,45 @@ _tr = {}
 _tr_fail = 0   # 재시도를 다 쓰고도 실패해서 원문으로 나간 건수
 
 
+def _parse_gtx(d):
+    """translate_a/single(gtx) 응답: d[0] = [[번역,원문,...], ...]."""
+    return "".join(s[0] for s in d[0] if s and s[0]).strip()
+
+
+def _parse_t(d):
+    """translate_a/t(dict-chrome-ex) 응답: ["번역"] 또는 [["번역","원문"]]."""
+    if not isinstance(d, list) or not d:
+        return ""
+    x = d[0]
+    if isinstance(x, list):
+        x = x[0] if x else ""
+    return (x or "").strip() if isinstance(x, str) else ""
+
+
+# 번역 엔드포인트를 순서대로 시도한다. 구글은 GitHub 러너 같은 데이터센터
+# IP 를 간헐적으로 429/403 로 막는데, 호스트마다 차단 여부가 달라서 한 곳이
+# 막혀도 다른 곳으로 번역이 나간다. 하나만 쓰면 그 호스트가 막히는 순간
+# 중국어 원문이 그대로 채널에 나간다(다른 봇에서 겪은 문제).
+TRANSLATE_EP = [
+    ("googleapis/gtx",
+     "https://translate.googleapis.com/translate_a/single"
+     "?client=gtx&sl=zh-CN&tl=ko&dt=t&q=%s", _parse_gtx),
+    ("clients5/dict",
+     "https://clients5.google.com/translate_a/t"
+     "?client=dict-chrome-ex&sl=zh-CN&tl=ko&q=%s", _parse_t),
+    ("google.com/gtx",
+     "https://translate.google.com/translate_a/single"
+     "?client=gtx&sl=zh-CN&tl=ko&dt=t&q=%s", _parse_gtx),
+]
+
+
 def translate(t):
     """
-    비공식 구글 번역. 실패하면 원문 반환(봇은 안 멈춤).
+    비공식 구글 번역. 여러 엔드포인트를 돌려 실패하면 원문 반환(봇은 안 멈춤).
 
-    gtx 는 간헐적으로 500 을 뱉는데 한 번 실패했다고 원문을 그대로 내보내면
-    중국어가 그대로 나간다. 일시적 오류는 재시도하고, 요청 자체가 잘못된
-    4xx 는 재시도해봐야 같은 결과이므로 즉시 포기한다.
+    한 호스트가 막히거나(429/403) 500·빈응답을 줘도 다음 호스트로 넘어간다.
+    엔드포인트를 다 돌리고도 안 되면 한 라운드 쉬었다 다시 시도하고, 그래도
+    안 되면 그때만 원문(중국어)을 내보낸다.
     """
     global _tr_fail
     if not t:
@@ -218,32 +250,30 @@ def translate(t):
     k = t[:500]
     if k in _tr:
         return _tr[k]
-    url = ("https://translate.googleapis.com/translate_a/single"
-           "?client=gtx&sl=zh-CN&tl=ko&dt=t&q="
-           + urllib.parse.quote(t[:4500]))
+    q = urllib.parse.quote(t[:4500])
     last = "unknown"
     for att in range(1, TRANSLATE_TRIES + 1):
-        try:
-            req = urllib.request.Request(url, headers={"User-Agent": UA})
-            with urllib.request.urlopen(req, timeout=8) as r:
-                d = json.loads(r.read().decode("utf-8", "replace"))
-            out = "".join(s[0] for s in d[0] if s and s[0]).strip()
-            if out:
-                if att > 1:
-                    log("translate ok (%d회째 시도)" % att)
-                _tr[k] = out
-                return out
-            last = "empty response"
-        except urllib.error.HTTPError as e:
-            last = "HTTP %d" % e.code
-            if 400 <= e.code < 500 and e.code != 429:
-                break   # 요청 자체 문제 -> 재시도 무의미
-        except Exception as e:
-            last = "%s: %s" % (type(e).__name__, e)
+        for name, tmpl, parse in TRANSLATE_EP:
+            try:
+                req = urllib.request.Request(tmpl % q, headers={"User-Agent": UA})
+                with urllib.request.urlopen(req, timeout=8) as r:
+                    d = json.loads(r.read().decode("utf-8", "replace"))
+                out = parse(d)
+                if out:
+                    if att > 1 or name != TRANSLATE_EP[0][0]:
+                        log("translate ok (%s, %d회째)" % (name, att))
+                    _tr[k] = out
+                    return out
+                last = "%s empty" % name
+            except urllib.error.HTTPError as e:
+                last = "%s HTTP %d" % (name, e.code)
+            except Exception as e:
+                last = "%s %s" % (name, type(e).__name__)
+        # 한 라운드에서 모든 호스트가 실패 -> 잠깐 쉬고 다시
         if att < TRANSLATE_TRIES:
             time.sleep(TRANSLATE_BACKOFF[att - 1])
     _tr_fail += 1
-    log("translate fail (%d회 시도, %s) -> 원문 사용" % (att, last))
+    log("translate fail (%d회, %s) -> 원문 사용" % (att, last))
     return t
 
 
