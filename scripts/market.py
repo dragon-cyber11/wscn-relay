@@ -20,7 +20,8 @@ CHART = "https://query1.finance.yahoo.com/v8/finance/chart/%s?interval=1d&range=
 IDX = {
     "asia": [
         ("000001.SS", "상하이", 2), ("^TWII", "대만가권", 2),
-        ("^N225", "닛케이", 2), ("^KS11", "코스피", 2), ("^HSI", "항셍", 2),
+        ("^N225", "닛케이", 2), ("^KS11", "코스피", 2), ("^KQ11", "코스닥", 2),
+        ("^HSI", "항셍", 2),
     ],
     "europe": [
         ("^GDAXI", "독일DAX", 2), ("^STOXX50E", "유로스톡스50", 2),
