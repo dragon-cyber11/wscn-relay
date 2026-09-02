@@ -16,6 +16,8 @@ CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
 DRY_RUN = os.environ.get("FNG_DRY_RUN", "0") == "1"
 # 수동 실행(workflow_dispatch)은 시간대와 무관하게 무조건 보낸다.
 FORCE = os.environ.get("FNG_FORCE", "0") == "1"
+# 어느 cron 이 깨웠는지(github.event.schedule). 스케줄 지연에 강하다.
+SCHEDULE = os.environ.get("FNG_SCHEDULE", "").strip()
 
 URL = "https://production.dataviz.cnn.io/index/fearandgreed/graphdata"
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -31,8 +33,31 @@ BACKOFF = (1.0, 3.0)
 #   마감 17:30 ET — 마감 1시간 30분 뒤, CNN 종가 반영이 끝난 뒤
 PHASES = ((13, 0, "미국장 장중"), (17, 30, "미국장 마감"))
 # cron 지연을 흡수하는 창. 두 후보 cron 이 1시간 간격이라 55분이면
-# 계절에 관계없이 정확히 하나만 창 안에 들어온다.
+# 계절에 관계없이 정확히 하나만 창 안에 들어온다. (스케줄 정보가 없는
+# 수동 실행 등의 보루용. 정규 스케줄은 아래 SCHED 로 판정한다.)
 WINDOW_MIN = 55
+
+# 어느 cron 이 깨웠는지로 발송 시점을 정한다. GitHub 스케줄은 부하 때
+# 몇 시간씩 지연되는데, 벽시계(phase)로 판정하면 늦게 뜬 크론이 발송창을
+# 지나쳐 F&G 가 통째로 누락된다(실측: 크론이 4시간半 밀림). cron 식별자로
+# 정하면 아무리 늦어도 안 바뀐다. 서머타임 후보 둘은 현재 뉴욕 오프셋으로
+# 맞는 것만 발송한다(크론은 계절 무관하게 매일 다 뜨므로).
+SCHED = {
+    "0 17 * * 1-5":  ("미국장 장중", -4),   # 13:00 ET (EDT)
+    "0 18 * * 1-5":  ("미국장 장중", -5),   # 13:00 ET (EST)
+    "30 21 * * 1-5": ("미국장 마감", -4),   # 17:30 ET (EDT)
+    "30 22 * * 1-5": ("미국장 마감", -5),   # 17:30 ET (EST)
+}
+
+
+def phase_from_schedule(cron):
+    """github.event.schedule -> 라벨. 계절이 안 맞는 후보 cron 이면 None."""
+    hit = SCHED.get((cron or "").strip())
+    if not hit:
+        return None          # F&G 와 무관한 크론(아시아·유럽 시황 등) -> 건너뜀
+    label, want_off = hit
+    off = datetime.now(NY).utcoffset().total_seconds() / 3600.0
+    return label if round(off) == want_off else None
 
 KO = {"extreme fear": "극단적 공포", "fear": "공포", "neutral": "중립",
       "greed": "탐욕", "extreme greed": "극단적 탐욕"}
@@ -220,13 +245,23 @@ def main():
     if not DRY_RUN and (not BOT_TOKEN or not CHAT_ID):
         log("FATAL: TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID 미설정")
         return 1
-    label, et = phase()
-    if label is None:
-        if not FORCE:
-            # 반대 계절용 cron 이 깨운 것이다. 실패가 아니므로 0 으로 끝낸다.
+    # 발송 시점 판정 우선순위:
+    #   1) 수동 강제(FORCE) -> 무조건 "현재"
+    #   2) 어느 cron 이 깨웠는지 SCHEDULE (정규 스케줄) — 지연에 강함
+    #   3) 벽시계 phase() (스케줄 정보 없을 때의 보루)
+    et = datetime.now(NY)
+    if FORCE:
+        label = "현재"
+    elif SCHEDULE:
+        label = phase_from_schedule(SCHEDULE)
+        if label is None:
+            log("이 시점/계절 발송 아님 (cron=%s) -> 건너뜀" % SCHEDULE)
+            return 0
+    else:
+        label, et = phase()
+        if label is None:
             log("발송 시점 아님 (뉴욕 %s) -> 건너뜀" % et.strftime("%m-%d %H:%M %Z"))
             return 0
-        label = "현재"
     try:
         j = fetch()
     except Exception as e:
