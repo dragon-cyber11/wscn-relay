@@ -1,1 +1,1 @@
-at=2026-09-04 14:12:18 KST last_id=3160336 send=1건 reason=ok send_reason=ok lag=27 rejects=0 dropped=0 unconfirmed=0 tr_fail=0 filtered=0 exit=normal
+at=2026-09-04 14:22:22 KST last_id=3160344 send=1건 reason=ok send_reason=ok lag=29 rejects=0 dropped=0 unconfirmed=0 tr_fail=0 filtered=0 exit=normal
