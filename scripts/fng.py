@@ -197,15 +197,24 @@ def tg_send(text):
         print("-" * 46)
         return True
     if CUSTOM_EMOJI:
-        if _post(to_html(text), "HTML"):
+        r = _post(to_html(text), "HTML")
+        if r != "fail":
             return True
-        # 커스텀 이모지는 봇/채팅 종류에 따라 거부된다. 메시지를 통째로
-        # 잃는 것보다 일반 이모지로라도 보내는 편이 낫다.
-        log("커스텀 이모지 발송 실패 -> 일반 이모지로 재시도")
-    return _post(text, None)
+        # 텔레그램이 명시적으로 거부했을 때만 일반 이모지로 다시 보낸다.
+        # 타임아웃은 이미 전달됐을 수 있어 폴백하면 중복이 된다.
+        log("커스텀 이모지 발송 거부 -> 일반 이모지로 재시도")
+    return _post(text, None) != "fail"
 
 
 def _post(text, parse_mode):
+    """
+    "ok" / "timeout" / "fail" 을 돌려준다.
+
+    응답 대기 중 타임아웃은 '전달됐을 수 있음'으로 보고 재시도하지 않는다.
+    텔레그램이 메시지를 받아놓고 응답만 늦게 주는 일이 있어서, 이걸 실패로
+    재시도하면 같은 메시지가 여러 번 꽂힌다(실측: 한 번에 4통 중복).
+    놓칠 위험보다 중복 폭탄이 더 나쁘다 — 속보 릴레이도 같은 원칙이다.
+    """
     payload = {"chat_id": CHAT_ID, "text": text,
                "disable_web_page_preview": "true"}
     if parse_mode:
@@ -217,9 +226,12 @@ def _post(text, parse_mode):
         try:
             req = urllib.request.Request(url, data=body, headers={
                 "Content-Type": "application/x-www-form-urlencoded"})
-            with urllib.request.urlopen(req, timeout=15) as r:
+            with urllib.request.urlopen(req, timeout=30) as r:
                 r.read()
-            return True
+            return "ok"
+        except TimeoutError as e:
+            log("전송 응답 타임아웃 -> 전달된 것으로 간주 (중복 방지, %s)" % e)
+            return "timeout"
         except urllib.error.HTTPError as e:
             last = "HTTP %d" % e.code
             if e.code == 429:
@@ -233,12 +245,17 @@ def _post(text, parse_mode):
                 continue
             if 400 <= e.code < 500:
                 break   # 설정 오류. 재시도해도 같다.
+        except urllib.error.URLError as e:
+            if isinstance(e.reason, TimeoutError):
+                log("전송 응답 타임아웃 -> 전달된 것으로 간주 (중복 방지)")
+                return "timeout"
+            last = "URLError: %s" % e.reason   # 연결 자체 실패 -> 재시도
         except Exception as e:
             last = "%s: %s" % (type(e).__name__, e)
         if att < TRIES:
             time.sleep(BACKOFF[att - 1])
     log("전송 실패 (%d회 시도, %s)" % (att, last))
-    return False
+    return "fail"
 
 
 def main():
