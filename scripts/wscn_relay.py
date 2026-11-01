@@ -648,6 +648,36 @@ def _counts(d, empty="0"):
     return ",".join("%s:%s" % kv for kv in sorted(d.items())) or empty
 
 
+# ── 폴리마켓 중간선거 확률: 정각마다 (한시 운영) ──
+# GitHub 크론은 지연·누락이 심해(실측: 매시 크론이 한 번도 안 뜸) 상시 도는
+# 이 루프에서 보낸다. 시간당 한 번만, 정각 후 PM_CATCHUP_MIN 분 안에서만 보낸다
+# (재시작으로 늦어졌을 때 직후 정각과 연달아 나가는 걸 막음). 보낸 시각은
+# .state 에 남겨 재시작해도 중복이 안 난다. 종료 시각 판정은 polymarket.py 가 한다.
+F_PM_LAST = STATE_DIR + "/polymarket_last.txt"
+PM_CATCHUP_MIN = 15
+_pm_last = None
+
+
+def polymarket_tick():
+    global _pm_last
+    now = datetime.now(KST)
+    key = now.strftime("%Y%m%d%H")
+    if _pm_last is None:
+        _pm_last = read_text(F_PM_LAST)
+    if key == _pm_last:
+        return
+    _pm_last = key
+    write_text(F_PM_LAST, key)   # 실패해도 이 시간은 끝(1초마다 재시도 방지)
+    if now.minute >= PM_CATCHUP_MIN:
+        log("폴리마켓 %s시 몫은 늦어서 건너뜀 (%d분)" % (now.strftime("%H"), now.minute))
+        return
+    try:
+        import polymarket
+        polymarket.main()
+    except Exception as e:
+        log("폴리마켓 발송 실패(속보 중계와 무관): %s" % e)
+
+
 def main():
     if not BOT_TOKEN or not CHAT_ID:
         log("FATAL: TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID 미설정")
@@ -699,6 +729,7 @@ def main():
     while time.time() - t0 < RUN_SECONDS:
         cyc = time.time()
         send_failed = False
+        polymarket_tick()
         try:
             fresh = fetch_since(last_id)
             feed_reason = "ok"
