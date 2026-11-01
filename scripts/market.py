@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""지역별 마감 시황 -> 텔레그램. 아시아·유럽·미국을 각 장 마감 뒤 따로 보낸다.
+"""지역별 시황 -> 텔레그램. 아시아·유럽·미국을 각 장 마감 뒤 따로 보내고,
+미국은 개장 30분 뒤 오전 시황도 한 번 보낸다.
 
 각 지역 장이 다 끝난 시각에 그 지역 주요 지수를 정리한다. 원자재·환율·금리는
 미국 마감 메시지에만 붙인다. 발송 시각 판정(서머타임 포함)은 아래 REGIONS 와
@@ -33,6 +34,7 @@ IDX = {
         ("^RUT", "러셀2000", 2), ("^VIX", "VIX", 2),
     ],
 }
+IDX["us_am"] = IDX["us"]   # 미국 오전 시황도 같은 지수
 
 # 원자재·환율은 미국 마감 메시지에만 붙는다(금리는 재무부 CSV 로 따로 처리).
 US_EXTRA = [
@@ -53,10 +55,13 @@ US_EXTRA = [
 #   아시아: 홍콩 16:00(HKT) 마감 뒤 = 서울 17:15. 한·일·중·대·홍 DST 없음(후보 1개).
 #   유럽:   프랑크푸르트/파리 17:30(CET/CEST) 마감 뒤 17:45 현지.
 #   미국:   16:00(ET) 마감 뒤, 종가 반영이 끝난 17:30 현지.
+#   미국 오전: 09:30(ET) 개장 30분 뒤 10:00 현지. 장중 값이라 '오전 시황'.
+# 값: (시간대, 시, 분, 지역명, 메시지 종류)
 REGIONS = {
-    "asia":   ("Asia/Seoul",       17, 15, "아시아"),
-    "europe": ("Europe/Berlin",    17, 45, "유럽"),
-    "us":     ("America/New_York",  17, 30, "미국"),
+    "asia":   ("Asia/Seoul",       17, 15, "아시아", "마감"),
+    "europe": ("Europe/Berlin",    17, 45, "유럽", "마감"),
+    "us_am":  ("America/New_York",  10,  0, "미국", "오전"),
+    "us":     ("America/New_York",  17, 30, "미국", "마감"),
 }
 # cron 지연을 흡수하는 창. 각 지역 발송창이 서로 겹치지 않을 만큼만.
 WINDOW_MIN = 55
@@ -82,7 +87,7 @@ def region_phase(now=None):
     늦게 떠도 발송되고, 1시간 어긋난 반대 계절 cron 은 창 밖이라 조용히 넘어간다.
     """
     utc = now or datetime.now(timezone.utc)
-    for key, (zone, h, m, _label) in REGIONS.items():
+    for key, (zone, h, m, _label, _kind) in REGIONS.items():
         loc = utc.astimezone(ZoneInfo(zone))
         target = loc.replace(hour=h, minute=m, second=0, microsecond=0)
         delta = (loc - target).total_seconds() / 60.0
@@ -101,6 +106,8 @@ SCHED = {
     "15 8 * * 1-5":  ("asia",   None),   # DST 없음
     "45 15 * * 1-5": ("europe",  2),     # CEST (UTC+2)
     "45 16 * * 1-5": ("europe",  1),     # CET  (UTC+1)
+    "0 14 * * 1-5":  ("us_am",  -4),     # 10:00 EDT
+    "0 15 * * 1-5":  ("us_am",  -5),     # 10:00 EST
     "30 21 * * 1-5": ("us",     -4),     # EDT  (UTC-4)
     "30 22 * * 1-5": ("us",     -5),     # EST  (UTC-5)
 }
@@ -274,7 +281,7 @@ def render(region):
     아시아·유럽은 지수만, 미국은 원자재·환율·금리까지.
     사유: ok / empty(전부 조회 실패) / holiday(오늘 거래 없음).
     """
-    zone, _h, _m, label = REGIONS[region]
+    zone, _h, _m, label, kind = REGIONS[region]
 
     # 지수를 먼저 채우면서 '오늘 거래된' 종목 수를 센다.
     idx_body, got, miss, traded = _fill_idx(IDX[region], zone)
@@ -286,8 +293,8 @@ def render(region):
     reason = "holiday" if traded == 0 else "ok"
 
     out = []
-    if region == "us":
-        # 미국: 지수 + 원자재·환율 + 금리. 구획이 여럿이라 소제목을 붙인다.
+    if region in ("us", "us_am"):
+        # 미국: 지수 + 원자재·환율 (+ 마감엔 금리). 구획이 여럿이라 소제목을 붙인다.
         out += ["[지수]"] + idx_body + [""]
         for title, rows in US_EXTRA:
             body, g, m = _fill(rows)
@@ -295,26 +302,28 @@ def render(region):
             miss += m
             if body:
                 out += ["[%s]" % title] + body + [""]
-        tr = treasury()
-        body = []
-        if len(tr) >= 2:
-            for col, name in YIELD_COLS:
-                try:
-                    v, pc = float(tr[0][col]), float(tr[1][col])
-                except (KeyError, TypeError, ValueError):
-                    miss += 1
-                    continue
-                body.append(yline(name, v, pc))
-                got += 1
-        else:
-            miss += len(YIELD_COLS)
-        if body:
-            out += ["[금리]"] + body + [""]
+        # 재무부 금리는 하루 한 번(오후) 갱신이라 오전엔 어제 값이다 -> 마감에만.
+        if region == "us":
+            tr = treasury()
+            body = []
+            if len(tr) >= 2:
+                for col, name in YIELD_COLS:
+                    try:
+                        v, pc = float(tr[0][col]), float(tr[1][col])
+                    except (KeyError, TypeError, ValueError):
+                        miss += 1
+                        continue
+                    body.append(yline(name, v, pc))
+                    got += 1
+            else:
+                miss += len(YIELD_COLS)
+            if body:
+                out += ["[금리]"] + body + [""]
     else:
         # 아시아·유럽: 지수 한 덩어리라 소제목 없이 나열한다.
         out += idx_body + [""]
 
-    head = "📊 %s 마감 시황 — %s" % (label, datetime.now(KST).strftime("%m-%d"))
+    head = "📊 %s %s 시황 — %s" % (label, kind, datetime.now(KST).strftime("%m-%d"))
     tail = "기준 %s KST" % datetime.now(KST).strftime("%H:%M")
     if miss:
         tail += " · %d개 항목 조회 실패" % miss
@@ -350,16 +359,16 @@ def main():
                 region = "us"   # 수동 강제인데 지정이 없으면 미국으로 본다
                 log("강제 발송: 지역 지정 없음 -> 미국 마감")
 
-    label = REGIONS[region][3]
+    label = "%s %s" % (REGIONS[region][3], REGIONS[region][4])
     msg, got, miss, reason = render(region)
     if msg is None:
-        log("FATAL: %s 마감 전 종목 조회 실패" % label)
+        log("FATAL: %s 전 종목 조회 실패" % label)
         return 1
     if reason == "holiday" and not FORCE:
         # 휴장일: 조용히 넘긴다(실패가 아니므로 0). 강제 발송은 그대로 보낸다.
         log("%s 휴장(오늘 거래 없음) -> 건너뜀" % label)
         return 0
-    log("발송: %s 마감 %d종목 (실패 %d)%s"
+    log("발송: %s %d종목 (실패 %d)%s"
         % (label, got, miss, " [휴장·강제]" if reason == "holiday" else ""))
     return 0 if tg_send(msg) else 1
 
