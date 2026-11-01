@@ -766,15 +766,16 @@ def main():
                 hhmm = to_kst(it.get("display_time"))
 
                 # 번역문은 본문, 원문과 시간은 텔레그램 인용 블록으로 붙인다.
-                quote = []
+                # 시간은 원문과 같은 줄에 붙인다: "원문 (HH:MM)"
+                parts = []
                 if ko.strip() != head.strip():
-                    quote.append(head)
+                    parts.append(head)
                 if hhmm:
-                    quote.append(hhmm)
+                    parts.append("(%s)" % hhmm)
                 msg = ko
                 qfrom = None
-                if quote:
-                    msg = ko + "\n" + "\n".join(quote)
+                if parts:
+                    msg = ko + "\n" + " ".join(parts)
                     qfrom = len(ko) + 1
                 if len(msg) > 4000:
                     msg = msg[:3990] + "…"
