@@ -129,6 +129,8 @@ jobs:
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          # LLM 번역(선택). 없으면 구글 번역만 쓴다.
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           WSCN_CHANNEL: global
           FILTER_NOISE: "1"     # 0 으로 두면 필터 끄고 전부 받음
           INIT_ONLY: ${{ inputs.init_only }}
