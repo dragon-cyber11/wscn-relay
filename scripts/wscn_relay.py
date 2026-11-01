@@ -305,11 +305,14 @@ def gemini_translate(text, src="Chinese", timeout=8):
         "natural Korean, in the terse style of a Korean wire-service headline.\n"
         "Rules:\n"
         "- Write everything in Hangul. Never output Chinese characters (Hanzi/Hanja).\n"
-        "- Expand Chinese abbreviations into full Korean names "
-        "(e.g. 沪深 -> 상하이·선전, 央行 -> 인민은행, 美联储 -> 연준).\n"
+        "- Expand Chinese-character abbreviations into their usual Korean names "
+        "(e.g. 沪深 -> 상하이·선전, 美联储 -> 연준).\n"
+        "- Keep acronyms written in Latin letters exactly as they are "
+        "(OPEC+, ECB, Fed, IMF, AI, ETF); do not spell them out.\n"
         "- Keep numbers, percentages, currencies, units and tickers exactly as in the source.\n"
         "- Use the common Korean spelling for well-known people and institutions.\n"
-        "- Do not add quotation marks or information that are not in the source.\n"
+        "- Translate only what the source says. Never add names, committees, "
+        "explanations, quotation marks or details that are not in the source.\n"
         "- Output only the Korean translation, nothing else.\n\n%s" % (src, text))
     body = {
         "contents": [{"role": "user", "parts": [{"text": prompt}]}],
@@ -321,12 +324,25 @@ def gemini_translate(text, src="Chinese", timeout=8):
                 "HARM_CATEGORY_SEXUALLY_EXPLICIT",
                 "HARM_CATEGORY_DANGEROUS_CONTENT")],
     }
-    try:
-        model = _gem_pick_model()
-        d = _gem_req("/%s:generateContent" % model, body, timeout=timeout)
+    def ask(b):
+        d = _gem_req("/%s:generateContent" % model, b, timeout=timeout)
         parts = (((d.get("candidates") or [{}])[0].get("content") or {})
                  .get("parts") or [])
-        out = "".join(p.get("text", "") for p in parts).strip()
+        return "".join(p.get("text", "") for p in parts).strip()
+
+    try:
+        model = _gem_pick_model()
+        out = ask(body)
+        if out and _HAN.search(out):
+            # 한자가 섞였으면 한 번만 고쳐 쓰게 한다. 구글로 바로 넘기면 숫자·통화
+            # 오역(千亿级 -> '수천억 달러')이 더 나쁠 때가 있다.
+            retry = dict(body)
+            retry["contents"] = body["contents"] + [
+                {"role": "model", "parts": [{"text": out}]},
+                {"role": "user", "parts": [{"text":
+                    "Your answer contains Chinese characters. Rewrite it in "
+                    "Hangul only, same meaning. Output only the translation."}]}]
+            out = ask(retry)
         # 모델이 번역문 전체를 따옴표로 감쌌을 때만 벗긴다(문장 안 따옴표는 유지)
         if len(out) >= 2 and out[0] in '"“' and out[-1] in '"”' \
                 and out[1:-1].count('"') == 0:
@@ -336,7 +352,7 @@ def gemini_translate(text, src="Chinese", timeout=8):
             return None
         # 한자가 한 글자라도 섞이면(産 같은 것) 구글 번역으로 넘긴다
         if _HAN.search(out):
-            log("Gemini 결과에 한자 섞임 -> 구글 번역으로")
+            log("Gemini 결과에 한자 섞임(재요청 후에도) -> 구글 번역으로")
             return None
         return out
     except urllib.error.HTTPError as e:
