@@ -295,6 +295,41 @@ def _gem_pick_model():
     return _gem_model
 
 
+def _gem_http_wait(e):
+    """
+    Gemini HTTP 오류를 보고 (쉴 초, 사유)를 돌려준다. 0 이면 쉬지 않는다.
+
+    400 은 두 종류다. 키·지역·결제처럼 모든 요청이 똑같이 실패하는 것
+    (API_KEY_INVALID, FAILED_PRECONDITION)은 쉬어야 하지만, 특정 문장만
+    거절된 INVALID_ARGUMENT 는 다음 건엔 멀쩡하므로 쉬면 손해다.
+    """
+    global _gem_model
+    try:
+        err = json.loads(e.read().decode("utf-8", "replace")).get("error") or {}
+    except Exception:
+        err = {}
+    status = err.get("status") or ""
+    reasons = [d.get("reason", "") for d in err.get("details") or []]
+    why = next((r for r in reasons if r), status) or "?"
+    if e.code == 429:
+        # 무료 한도. 서버가 알려준 재시도 시각(예: "37s")이 있으면 그만큼만 쉰다.
+        for d in err.get("details") or []:
+            m = re.match(r"(\d+)", str(d.get("retryDelay", "")))
+            if m:
+                return min(max(int(m.group(1)) + 1, 30), GEMINI_COOLDOWN), why
+        return GEMINI_COOLDOWN, why
+    if e.code == 404:
+        _gem_model = None      # 모델이 내려갔다. 다음엔 목록에서 다시 고른다.
+        return GEMINI_SLOW_COOLDOWN, why
+    if e.code in (401, 403):
+        return GEMINI_COOLDOWN, why
+    if e.code == 400 and ("API_KEY" in why or status == "FAILED_PRECONDITION"):
+        return GEMINI_COOLDOWN, why
+    if e.code >= 500:
+        return 60, why         # 구글 쪽 일시 장애
+    return 0, why
+
+
 def gemini_translate(text, src="Chinese", timeout=8):
     """성공하면 번역문, 안 쓰거나 실패하면 None (호출자가 폴백)."""
     global _gem_off_until
@@ -356,10 +391,13 @@ def gemini_translate(text, src="Chinese", timeout=8):
             return None
         return out
     except urllib.error.HTTPError as e:
-        if e.code in (400, 401, 403, 404, 429):
-            # 한도 초과·키 문제·모델 없음: 한동안 쉬고 구글로 간다
-            _gem_off_until = time.time() + GEMINI_COOLDOWN
-            log("Gemini HTTP %d -> %d분간 구글 번역으로" % (e.code, GEMINI_COOLDOWN // 60))
+        wait, why = _gem_http_wait(e)
+        if wait:
+            _gem_off_until = time.time() + wait
+            log("Gemini HTTP %d(%s) -> %d초간 구글 번역으로" % (e.code, why, wait))
+        else:
+            # 이 문장만의 문제(입력 거절 등). 전체를 쉬지 않고 이번 건만 넘긴다.
+            log("Gemini HTTP %d(%s) -> 이번 건만 구글 번역으로" % (e.code, why))
         return None
     except Exception as e:
         # 느려서 타임아웃이 나면 잠깐 쉰다. 계속 두드리면 건마다 타임아웃만큼 밀린다.

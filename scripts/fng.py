@@ -6,7 +6,7 @@
 영향이 없고, 반대도 마찬가지다.
 """
 
-import html, json, os, sys, time
+import json, os, sys, time
 import urllib.error, urllib.parse, urllib.request
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
@@ -65,34 +65,9 @@ EMO = {"extreme fear": "😱", "fear": "😨", "neutral": "😐",
        "greed": "🤑", "extreme greed": "🔥"}
 
 
-# 커스텀(프리미엄) 이모지. {일반 이모지: custom_emoji_id} 로 적으면
-# 그 문자를 <tg-emoji> 로 감싸 보낸다. 비어 있으면 일반 이모지로 나간다.
-# 여기 키는 market.py 의 UP/DOWN/FLAT 글자와 반드시 같아야 치환된다.
-#
-# ID 는 봇 토큰으로 확인한다(팩 이름은 t.me/addemoji/<이름> 의 <이름>).
-# 저장소 Actions 의 emoji-ids 워크플로를 돌리면 아래 형식으로 찍힌다:
-#   curl -s "https://api.telegram.org/bot<TOKEN>/getStickerSet?name=NewsEmoji" \
-#     | python3 -m json.tool | grep -E '"emoji"|custom_emoji_id'
-#
-# 주의: 커스텀 이모지는 봇이 Fragment 에서 유저네임을 샀거나, 봇 소유자가
-# 프리미엄이고 private/group/supergroup 으로 직접 보낼 때만 쓸 수 있다
-# (공식 문서). 허용 목록에 채널이 없어 될지는 보내봐야 안다. 실패하면
-# 일반 이모지로 자동 재시도하므로, 안 되면 그냥 평범한 📈📉 로 나간다.
-CUSTOM_EMOJI = {
-    "📈": "5244837092042750681",   # 상승
-    "📉": "5246762912428603768",   # 하락
-    "➡️": "5416117059207572332",   # 보합
-}
-
-
-def to_html(text):
-    """평문을 HTML 모드용으로 바꾸고, 설정된 이모지만 커스텀으로 치환한다."""
-    out = html.escape(text)
-    for ch, eid in CUSTOM_EMOJI.items():
-        esc = html.escape(ch)
-        out = out.replace(
-            esc, '<tg-emoji emoji-id="%s">%s</tg-emoji>' % (eid, esc))
-    return out
+# 커스텀(프리미엄) 이모지는 쓰지 않는다. 채널에서는 봇이 Fragment 에서
+# 유저네임을 사야만(유료) 살아남고, 아니면 텔레그램이 일반 이모지로 바꿔
+# 버린다(공식 문서). 그래서 평문 📈📉➡️ 로 보낸다.
 
 
 def log(m):
@@ -193,20 +168,13 @@ def tg_send(text):
     if DRY_RUN:
         log("DRY_RUN — 전송 생략")
         print("-" * 46)
-        print(to_html(text) if CUSTOM_EMOJI else text)
+        print(text)
         print("-" * 46)
         return True
-    if CUSTOM_EMOJI:
-        r = _post(to_html(text), "HTML")
-        if r != "fail":
-            return True
-        # 텔레그램이 명시적으로 거부했을 때만 일반 이모지로 다시 보낸다.
-        # 타임아웃은 이미 전달됐을 수 있어 폴백하면 중복이 된다.
-        log("커스텀 이모지 발송 거부 -> 일반 이모지로 재시도")
-    return _post(text, None) != "fail"
+    return _post(text) != "fail"
 
 
-def _post(text, parse_mode):
+def _post(text):
     """
     "ok" / "timeout" / "fail" 을 돌려준다.
 
@@ -217,8 +185,6 @@ def _post(text, parse_mode):
     """
     payload = {"chat_id": CHAT_ID, "text": text,
                "disable_web_page_preview": "true"}
-    if parse_mode:
-        payload["parse_mode"] = parse_mode
     url = "https://api.telegram.org/bot%s/sendMessage" % BOT_TOKEN
     body = urllib.parse.urlencode(payload).encode()
     last = "unknown"
