@@ -721,6 +721,21 @@ def scheduled_tick():
         except Exception as e:
             log("%s 발송 실패(속보 중계와 무관): %s" % (name, e))
 
+
+_spike = None
+
+
+def spike_tick():
+    """급변동 감시(scripts/spike.py). 어떤 오류도 속보 중계를 멈추지 않는다."""
+    global _spike
+    try:
+        if _spike is None:
+            import spike as _m
+            _spike = _m
+        _spike.tick()
+    except Exception as e:
+        log("급변동 감시 오류(속보 중계와 무관): %s" % e)
+
 def main():
     if not BOT_TOKEN or not CHAT_ID:
         log("FATAL: TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID 미설정")
@@ -773,6 +788,7 @@ def main():
         cyc = time.time()
         send_failed = False
         scheduled_tick()
+        spike_tick()
         try:
             fresh = fetch_since(last_id)
             feed_reason = "ok"
