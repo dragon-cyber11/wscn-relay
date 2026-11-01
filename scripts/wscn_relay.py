@@ -249,6 +249,7 @@ GEMINI_COOLDOWN = 900        # 거절(한도·권한) 후 Gemini 를 쉬는 시�
 GEMINI_SLOW_COOLDOWN = 300   # 타임아웃(느림) 후 쉬는 시간(초)
 _gem_off_until = 0.0
 _gem_model = None            # 프로세스당 한 번만 고른다
+_HAN = re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]")
 
 
 def _gem_req(path, body=None, timeout=8):
@@ -301,10 +302,15 @@ def gemini_translate(text, src="Chinese", timeout=8):
         return None
     prompt = (
         "Translate the following %s financial breaking-news headline into "
-        "natural Korean, in the terse style of a Korean wire-service headline. "
-        "Keep numbers, percentages, units, tickers and names exact; use the "
-        "common Korean spelling for well-known people and institutions. "
-        "Output only the Korean translation, nothing else.\n\n%s" % (src, text))
+        "natural Korean, in the terse style of a Korean wire-service headline.\n"
+        "Rules:\n"
+        "- Write everything in Hangul. Never output Chinese characters (Hanzi/Hanja).\n"
+        "- Expand Chinese abbreviations into full Korean names "
+        "(e.g. 沪深 -> 상하이·선전, 央行 -> 인민은행, 美联储 -> 연준).\n"
+        "- Keep numbers, percentages, currencies, units and tickers exactly as in the source.\n"
+        "- Use the common Korean spelling for well-known people and institutions.\n"
+        "- Do not add quotation marks or information that are not in the source.\n"
+        "- Output only the Korean translation, nothing else.\n\n%s" % (src, text))
     body = {
         "contents": [{"role": "user", "parts": [{"text": prompt}]}],
         "generationConfig": {"temperature": 0, "maxOutputTokens": 1024},
@@ -327,6 +333,10 @@ def gemini_translate(text, src="Chinese", timeout=8):
             out = out[1:-1].strip()
         # 번역 대신 원문을 되돌려 줬거나 빈 응답이면 실패로 본다
         if not out or out == text.strip():
+            return None
+        # 한자가 한 글자라도 섞이면(産 같은 것) 구글 번역으로 넘긴다
+        if _HAN.search(out):
+            log("Gemini 결과에 한자 섞임 -> 구글 번역으로")
             return None
         return out
     except urllib.error.HTTPError as e:
