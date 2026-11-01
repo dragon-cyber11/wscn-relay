@@ -417,7 +417,12 @@ def translate(t):
     return t
 
 
-def tg_send(text):
+def _u16(s):
+    """텔레그램 entity 오프셋/길이 단위(UTF-16 코드 단위)."""
+    return len(s.encode("utf-16-le")) // 2
+
+
+def tg_send(text, quote_from=None):
     """
     전송 판정 규칙
       200            -> 성공
@@ -432,9 +437,15 @@ def tg_send(text):
     if not BOT_TOKEN or not CHAT_ID:
         return False, "no_credentials"
     url = "https://api.telegram.org/bot%s/sendMessage" % BOT_TOKEN
-    body = urllib.parse.urlencode({
-        "chat_id": CHAT_ID, "text": text,
-        "disable_web_page_preview": "true"}).encode()
+    fields = {"chat_id": CHAT_ID, "text": text,
+              "disable_web_page_preview": "true"}
+    # 원문·시간을 텔레그램 인용 블록(왼쪽 세로줄)으로. quote_from(문자 위치)부터
+    # 끝까지. entity 방식이라 본문에 HTML 이스케이프가 필요 없다.
+    if quote_from is not None and 0 < quote_from < len(text):
+        fields["entities"] = json.dumps([{
+            "type": "blockquote", "offset": _u16(text[:quote_from]),
+            "length": _u16(text[quote_from:])}])
+    body = urllib.parse.urlencode(fields).encode()
     for _ in range(3):
         try:
             req = urllib.request.Request(url, data=body, headers={
@@ -461,6 +472,11 @@ def tg_send(text):
                 return False, "auth_401"
             if code == 400:
                 kind = "cfg" if any(x in desc for x in CONFIG_400) else "msg"
+                if kind == "msg" and "entities" in fields:
+                    # 인용 서식이 거부됐을 수 있다 -> 서식 없이 딱 한 번 더
+                    log("400 (서식 포함) -> 서식 빼고 재시도: %s" % desc[:80])
+                    _last_reject = 0.0
+                    return tg_send(text)
                 log("400/%s: %s" % (kind, desc[:80]))
                 return False, "bad400_%s" % kind
             return False, "http_%d" % code
@@ -749,16 +765,21 @@ def main():
                 ko = translate(head)
                 hhmm = to_kst(it.get("display_time"))
 
-                lines = [ko]
+                # 번역문은 본문, 원문과 시간은 텔레그램 인용 블록으로 붙인다.
+                quote = []
                 if ko.strip() != head.strip():
-                    lines.append("(원문: %s)" % head)
+                    quote.append(head)
                 if hhmm:
-                    lines.append("(%s)" % hhmm)
-                msg = "\n".join(lines)
+                    quote.append(hhmm)
+                msg = ko
+                qfrom = None
+                if quote:
+                    msg = ko + "\n" + "\n".join(quote)
+                    qfrom = len(ko) + 1
                 if len(msg) > 4000:
                     msg = msg[:3990] + "…"
 
-                ok, send_reason = tg_send(msg)
+                ok, send_reason = tg_send(msg, quote_from=qfrom)
                 if ok:
                     if send_reason == "unknown_treated_sent":
                         # 실제 도달 여부 불명. 눈에 보이게 세어둔다.
