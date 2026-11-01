@@ -246,6 +246,7 @@ GEMINI_KEY = os.environ.get("GEMINI_API_KEY", "").strip()
 GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "").strip()
 GEMINI_BASE = "https://generativelanguage.googleapis.com/v1beta"
 GEMINI_COOLDOWN = 900        # 거절(한도·권한) 후 Gemini 를 쉬는 시간(초)
+GEMINI_SLOW_COOLDOWN = 300   # 타임아웃(느림) 후 쉬는 시간(초)
 _gem_off_until = 0.0
 _gem_model = None            # 프로세스당 한 번만 고른다
 
@@ -335,7 +336,13 @@ def gemini_translate(text, src="Chinese", timeout=8):
             log("Gemini HTTP %d -> %d분간 구글 번역으로" % (e.code, GEMINI_COOLDOWN // 60))
         return None
     except Exception as e:
-        log("Gemini 실패(%s) -> 구글 번역으로" % type(e).__name__)
+        # 느려서 타임아웃이 나면 잠깐 쉰다. 계속 두드리면 건마다 타임아웃만큼 밀린다.
+        slow = isinstance(e, TimeoutError) or isinstance(
+            getattr(e, "reason", None), TimeoutError)
+        if slow:
+            _gem_off_until = time.time() + GEMINI_SLOW_COOLDOWN
+        log("Gemini 실패(%s)%s -> 구글 번역으로" % (
+            type(e).__name__, " %d분 쉼" % (GEMINI_SLOW_COOLDOWN // 60) if slow else ""))
         return None
 
 
