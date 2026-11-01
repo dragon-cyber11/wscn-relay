@@ -686,35 +686,40 @@ def _counts(d, empty="0"):
     return ",".join("%s:%s" % kv for kv in sorted(d.items())) or empty
 
 
-# ── 폴리마켓 중간선거 확률: 정각마다 (한시 운영) ──
+# ── 정시 발송 (폴리마켓 중간선거·FOMC) ──
 # GitHub 크론은 지연·누락이 심해(실측: 매시 크론이 한 번도 안 뜸) 상시 도는
-# 이 루프에서 보낸다. 시간당 한 번만, 정각 후 PM_CATCHUP_MIN 분 안에서만 보낸다
-# (재시작으로 늦어졌을 때 직후 정각과 연달아 나가는 걸 막음). 보낸 시각은
-# .state 에 남겨 재시작해도 중복이 안 난다. 종료 시각 판정은 polymarket.py 가 한다.
-F_PM_LAST = STATE_DIR + "/polymarket_last.txt"
-PM_CATCHUP_MIN = 15
-_pm_last = None
+# 이 루프에서 보낸다. 정해진 KST 시각마다 한 번, 정각 후 TICK_CATCHUP_MIN 분
+# 안에서만 보낸다(재시작으로 늦어졌을 때 직후 슬롯과 연달아 나가는 걸 막음).
+# 보낸 슬롯은 .state 에 남겨 재시작해도 중복이 안 난다.
+# (이름, 보낼 KST 시 집합 — None 이면 매시, 모듈 이름, 상태 파일)
+TICK_JOBS = [
+    # 중간선거는 polymarket.py 가 DEADLINE(11/3) 이후 스스로 건너뛴다.
+    ("폴리마켓 중간선거", None, "polymarket", STATE_DIR + "/polymarket_last.txt"),
+    ("폴리마켓 FOMC", {8, 22}, "fomc", STATE_DIR + "/fomc_last.txt"),
+]
+TICK_CATCHUP_MIN = 15
+_tick_last = {}
 
 
-def polymarket_tick():
-    global _pm_last
+def scheduled_tick():
     now = datetime.now(KST)
     key = now.strftime("%Y%m%d%H")
-    if _pm_last is None:
-        _pm_last = read_text(F_PM_LAST)
-    if key == _pm_last:
-        return
-    _pm_last = key
-    write_text(F_PM_LAST, key)   # 실패해도 이 시간은 끝(1초마다 재시도 방지)
-    if now.minute >= PM_CATCHUP_MIN:
-        log("폴리마켓 %s시 몫은 늦어서 건너뜀 (%d분)" % (now.strftime("%H"), now.minute))
-        return
-    try:
-        import polymarket
-        polymarket.main()
-    except Exception as e:
-        log("폴리마켓 발송 실패(속보 중계와 무관): %s" % e)
-
+    for name, hours, mod, path in TICK_JOBS:
+        if hours is not None and now.hour not in hours:
+            continue
+        if mod not in _tick_last:
+            _tick_last[mod] = read_text(path)
+        if _tick_last[mod] == key:
+            continue
+        _tick_last[mod] = key
+        write_text(path, key)   # 실패해도 이 슬롯은 끝(1초마다 재시도 방지)
+        if now.minute >= TICK_CATCHUP_MIN:
+            log("%s %s시 몫은 늦어서 건너뜀 (%d분)" % (name, now.strftime("%H"), now.minute))
+            continue
+        try:
+            __import__(mod).main()
+        except Exception as e:
+            log("%s 발송 실패(속보 중계와 무관): %s" % (name, e))
 
 def main():
     if not BOT_TOKEN or not CHAT_ID:
@@ -767,7 +772,7 @@ def main():
     while time.time() - t0 < RUN_SECONDS:
         cyc = time.time()
         send_failed = False
-        polymarket_tick()
+        scheduled_tick()
         try:
             fresh = fetch_since(last_id)
             feed_reason = "ok"
