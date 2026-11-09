@@ -687,7 +687,7 @@ def _counts(d, empty="0"):
     return ",".join("%s:%s" % kv for kv in sorted(d.items())) or empty
 
 
-# ── 정시 발송 (폴리마켓 중간선거·FOMC) ──
+# ── 정시 발송 (폴리마켓 FOMC) ──
 # GitHub 크론은 지연·누락이 심해(실측: 매시 크론이 한 번도 안 뜸) 상시 도는
 # 이 루프에서 보낸다. 정해진 현지 시각마다 한 번, 정각 후 TICK_CATCHUP_MIN 분
 # 안에서만 보낸다(재시작으로 늦어졌을 때 직후 슬롯과 연달아 나가는 걸 막음).
@@ -695,9 +695,6 @@ def _counts(d, empty="0"):
 # (이름, 시간대, 보낼 시 집합 — None 이면 매시, 평일만?, 모듈 이름, 상태 파일)
 # 시간대를 현지로 적으면 서머타임은 zoneinfo 가 알아서 따라간다.
 TICK_JOBS = [
-    # 중간선거는 polymarket.py 가 DEADLINE(11/3) 이후 스스로 건너뛴다.
-    ("폴리마켓 중간선거", "Asia/Seoul", None, False, "polymarket",
-     STATE_DIR + "/polymarket_last.txt"),
     # 미국 장 마감(16:00 ET) 직후 하루 한 번. 평일만.
     ("폴리마켓 FOMC", "America/New_York", {16}, True, "fomc",
      STATE_DIR + "/fomc_last.txt"),
