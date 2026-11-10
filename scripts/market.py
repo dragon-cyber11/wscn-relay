@@ -373,5 +373,20 @@ def main():
     return 0 if tg_send(msg) else 1
 
 
+
+def send(region):
+    """릴레이 루프 정시 발송용. 휴장(오늘 거래 없음)이면 조용히 건너뛴다."""
+    label = "%s %s" % (REGIONS[region][3], REGIONS[region][4])
+    msg, got, miss, reason = render(region)
+    if msg is None:
+        log("%s 전 종목 조회 실패" % label)
+        return False
+    if reason == "holiday":
+        log("%s 휴장(오늘 거래 없음) -> 건너뜀" % label)
+        return True
+    log("발송: %s %d종목 (실패 %d)" % (label, got, miss))
+    return tg_send(msg)
+
+
 if __name__ == "__main__":
     sys.exit(main())

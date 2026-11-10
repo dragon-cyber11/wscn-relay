@@ -256,5 +256,12 @@ def main():
     return 0 if tg_send(msg) else 1
 
 
+
+def send(label):
+    """릴레이 루프 정시 발송용: 판정 없이 label 로 바로 보낸다."""
+    msg = render(fetch(), label)
+    log("발송: %s / %s" % (label, msg.split("\n")[2].strip()))
+    return tg_send(msg)
+
 if __name__ == "__main__":
     sys.exit(main())

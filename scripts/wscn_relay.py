@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """华尔街见闻 7x24 快讯 -> 텔레그램. 속보(lives)만 중계."""
 
-import html, json, os, re, subprocess, sys, time
+import html, json, os, re, subprocess, sys, threading, time
 import urllib.error, urllib.parse, urllib.request
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
@@ -687,44 +687,62 @@ def _counts(d, empty="0"):
     return ",".join("%s:%s" % kv for kv in sorted(d.items())) or empty
 
 
-# ── 정시 발송 (폴리마켓 FOMC) ──
-# GitHub 크론은 지연·누락이 심해(실측: 매시 크론이 한 번도 안 뜸) 상시 도는
-# 이 루프에서 보낸다. 정해진 현지 시각마다 한 번, 정각 후 TICK_CATCHUP_MIN 분
-# 안에서만 보낸다(재시작으로 늦어졌을 때 직후 슬롯과 연달아 나가는 걸 막음).
+# ── 정시 발송 (시황·공포탐욕·FOMC) ──
+# GitHub 크론은 지연·누락이 심해(실측 11월: 미국 오전 시황·공탐 장중이 1~1.5시간
+# 늦게 뜸) 상시 도는 이 루프에서 보낸다. 슬롯 시각 이후 TICK_CATCHUP_MIN 분
+# 안에서만 보낸다(재시작으로 늦어졌을 때 엉뚱한 시각에 나가는 걸 막음).
 # 보낸 슬롯은 .state 에 남겨 재시작해도 중복이 안 난다.
-# (이름, 시간대, 보낼 시 집합 — None 이면 매시, 평일만?, 모듈 이름, 상태 파일)
-# 시간대를 현지로 적으면 서머타임은 zoneinfo 가 알아서 따라간다.
+# 시간대를 현지로 적으면 서머타임은 zoneinfo 가 알아서 따라간다. 모두 평일만.
+def _job(mod, fn, arg):
+    return lambda: getattr(__import__(mod), fn)(arg)
+
+
+# (이름, 시간대, (시, 분), 할 일들 — 순서대로)
 TICK_JOBS = [
-    # 미국 장 마감(16:00 ET) 직후 하루 한 번. 평일만.
-    ("폴리마켓 FOMC", "America/New_York", {16}, True, "fomc",
-     STATE_DIR + "/fomc_last.txt"),
+    ("아시아 마감 시황", "Asia/Seoul", (17, 15), [_job("market", "send", "asia")]),
+    ("유럽 마감 시황", "Europe/Berlin", (17, 45), [_job("market", "send", "europe")]),
+    ("미국 오전 시황", "America/New_York", (10, 0), [_job("market", "send", "us_am")]),
+    ("공탐 장중", "America/New_York", (13, 0), [_job("fng", "send", "미국장 장중")]),
+    ("FOMC 폴리마켓", "America/New_York", (16, 0), [lambda: __import__("fomc").main()]),
+    ("미국 마감", "America/New_York", (17, 30), [_job("fng", "send", "미국장 마감"),
+                                              _job("market", "send", "us")]),
 ]
+F_TICK = STATE_DIR + "/tick_sent.json"
 TICK_CATCHUP_MIN = 15
-_tick_last = {}
+_tick_sent = None
 
 
 def scheduled_tick():
-    for name, zone, hours, weekdays, mod, path in TICK_JOBS:
-        now = datetime.now(ZoneInfo(zone))
-        if hours is not None and now.hour not in hours:
-            continue
-        if weekdays and now.weekday() >= 5:
-            continue
-        key = now.strftime("%Y%m%d%H")
-        if mod not in _tick_last:
-            _tick_last[mod] = read_text(path)
-        if _tick_last[mod] == key:
-            continue
-        _tick_last[mod] = key
-        write_text(path, key)   # 실패해도 이 슬롯은 끝(1초마다 재시도 방지)
-        if now.minute >= TICK_CATCHUP_MIN:
-            log("%s %s시 몫은 늦어서 건너뜀 (%d분)" % (name, now.strftime("%H"), now.minute))
-            continue
+    global _tick_sent
+    if _tick_sent is None:
         try:
-            __import__(mod).main()
+            _tick_sent = json.loads(read_text(F_TICK, "{}") or "{}")
+        except Exception:
+            _tick_sent = {}
+    for name, zone, (h, m), steps in TICK_JOBS:
+        now = datetime.now(ZoneInfo(zone))
+        if now.weekday() >= 5:
+            continue
+        target = now.replace(hour=h, minute=m, second=0, microsecond=0)
+        late = (now - target).total_seconds() / 60.0
+        if not 0 <= late < TICK_CATCHUP_MIN:
+            continue
+        day = now.strftime("%Y-%m-%d")
+        if _tick_sent.get(name) == day:
+            continue
+        _tick_sent[name] = day
+        write_text(F_TICK, json.dumps(_tick_sent, ensure_ascii=False))  # 먼저 기록(중복 방지)
+        log("정시 발송: %s (현지 %s)" % (name, now.strftime("%H:%M")))
+        # 시황은 종목 조회에 10~20초 걸린다. 속보 중계를 그만큼 멈추지 않게 따로 돌린다.
+        threading.Thread(target=_run_steps, args=(name, steps), daemon=True).start()
+
+
+def _run_steps(name, steps):
+    for step in steps:
+        try:
+            step()
         except Exception as e:
             log("%s 발송 실패(속보 중계와 무관): %s" % (name, e))
-
 
 _spike = None
 
