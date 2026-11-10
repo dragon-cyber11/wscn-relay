@@ -1,0 +1,38 @@
+name: send
+
+# 일회성 수동 발송 버튼. Actions 탭 -> send -> Run workflow 에서 고른다.
+# 정규 발송(정시·장 마감)은 wscn 릴레이 루프와 fng 워크플로가 따로 한다.
+# 항목을 늘리려면 options 와 아래 case 에 한 줄씩 추가한다.
+
+on:
+  workflow_dispatch:
+    inputs:
+      what:
+        description: "보낼 것"
+        type: choice
+        options:
+          - fomc
+        default: fomc
+
+permissions:
+  contents: read
+
+jobs:
+  send:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Send
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          WHAT: ${{ inputs.what }}
+        run: |
+          case "$WHAT" in
+            fomc) python3 scripts/fomc.py ;;
+            *) echo "알 수 없는 항목: $WHAT"; exit 1 ;;
+          esac
