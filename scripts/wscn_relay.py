@@ -7,7 +7,10 @@ import urllib.error, urllib.parse, urllib.request
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
-HOSTS = ["https://api-one.wallstcn.com", "https://api.wallstcn.com"]
+# 11/24 wallstcn.com 의 api 하위 도메인이 DNS 에서 사라졌다(NXDOMAIN). 사이트가
+# 지금 쓰는 주소(웹 번들에서 확인)를 앞에 두고, 옛 주소는 되살아날 때를 대비해 뒤에 둔다.
+HOSTS = ["https://api-one-wscn.awtmt.com",
+         "https://api-one.wallstcn.com", "https://api.wallstcn.com"]
 CHANNEL = os.environ.get("WSCN_CHANNEL", "global")
 BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
 CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
@@ -571,6 +574,20 @@ def to_kst(dt_val):
         return None
 
 
+MAX_AGE_MIN = 30   # 이보다 오래된 속보는 보내지 않는다(장애 뒤 재개 시 몰아치기 방지)
+
+
+def _age_min(dt_val):
+    """display_time(epoch) 기준 경과 분. 모르면 None(그럼 보낸다)."""
+    try:
+        ts = float(dt_val)
+        if ts > 1e11:
+            ts /= 1000.0
+        return (time.time() - ts) / 60.0
+    except Exception:
+        return None
+
+
 def clean(s):
     if not s:
         return ""
@@ -857,6 +874,13 @@ def main():
                 iid = int(it.get("id") or 0)
                 head = headline(it)
                 if not head:
+                    last_id = max(last_id, iid)
+                    write_text(F_LAST_ID, str(last_id))
+                    continue
+                # 장애 뒤 재개하면 며칠 묵은 속보가 쏟아진다. 오래된 건 보내지 않고 넘긴다.
+                age = _age_min(it.get("display_time"))
+                if age is not None and age > MAX_AGE_MIN:
+                    filt["stale"] = filt.get("stale", 0) + 1
                     last_id = max(last_id, iid)
                     write_text(F_LAST_ID, str(last_id))
                     continue
